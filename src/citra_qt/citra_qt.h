@@ -61,6 +61,7 @@ class QProgressBar;
 class QPushButton;
 class QSlider;
 class RegistersWidget;
+class SkylanderPortalWindow;
 class WaitTreeWidget;
 
 namespace Camera {
@@ -292,6 +293,7 @@ private slots:
     void OnSaveMovie();
     void OnCaptureScreenshot();
     void OnDumpVideo();
+    void ShowSkylanderPortal();
     void OnCompressFile();
     void OnDecompressFile();
 #ifdef _WIN32
@@ -313,6 +315,7 @@ private slots:
 #ifdef ENABLE_QT_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
 #endif
+    void ShowInfinityBase();
     void OnSwitchDiskResources(VideoCore::LoadCallbackStage stage, std::size_t value,
                                std::size_t total, const std::string& object);
 #ifdef ENABLE_DEVELOPER_OPTIONS
@@ -407,6 +410,7 @@ private:
     // Whether game was paused due to stopping video dumping
     bool game_paused_for_dumping = false;
 
+    SkylanderPortalWindow* m_skylander_window = nullptr;
     int gdbport_from_arg = -1;
 
     QString gl_renderer;

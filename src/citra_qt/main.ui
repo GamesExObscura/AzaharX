@@ -222,6 +222,8 @@
     <addaction name="action_Capture_Screenshot"/>
     <addaction name="action_Dump_Video"/>
     <addaction name="separator"/>
+    <addaction name="action_Manage_Skylanders"/>
+    <addaction name="action_Manage_Disney_Infinity"/>
     <addaction name="action_Compress_ROM_File"/>
     <addaction name="action_Decompress_ROM_File"/>
    </widget>
@@ -512,6 +514,16 @@
    </property>
    <property name="text">
     <string>Dump Video</string>
+   </property>
+  </action>
+  <action name="action_Manage_Skylanders">
+   <property name="text">
+    <string>Manage Skylanders</string>
+   </property>
+  </action>
+  <action name="action_Manage_Disney_Infinity">
+   <property name="text">
+    <string>Manage Disney Infinity</string>
    </property>
   </action>
   <action name="action_Compress_ROM_File">

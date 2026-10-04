@@ -1,4 +1,4 @@
-// Copyright 2015 Citra Emulator Project
+// Copyright Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
@@ -22,6 +22,8 @@ namespace Service::IR {
 
 class BufferManager;
 class ExtraHID;
+class IRPortal;
+class IRInfinityBase;  // Forward declaration instead of include
 
 /// An interface representing a device that can communicate with 3DS via ir:USER service
 class IRDevice {
@@ -83,6 +85,8 @@ private:
      */
     void InitializeIrNopShared(Kernel::HLERequestContext& ctx);
 
+    void InitializeIrNop(Kernel::HLERequestContext& ctx);
+
     /**
      * RequireConnection service function
      * Searches for an IR device and connects to it. After connecting to the device, applications
@@ -96,6 +100,8 @@ private:
      *      1 : Result of function, 0 on success, otherwise error code
      */
     void RequireConnection(Kernel::HLERequestContext& ctx);
+
+    void AutoConnection(Kernel::HLERequestContext& ctx);
 
     /**
      * GetReceiveEvent service function
@@ -135,6 +141,8 @@ private:
      */
     void GetConnectionStatusEvent(Kernel::HLERequestContext& ctx);
 
+    void GetConnectionStatus(Kernel::HLERequestContext& ctx);
+
     /**
      * FinalizeIrNop service function
      * Finalize ir:USER service.
@@ -155,6 +163,18 @@ private:
      */
     void SendIrNop(Kernel::HLERequestContext& ctx);
 
+    void ReceiveIrnopLarge(Kernel::HLERequestContext& ctx);
+
+    /**
+     * Older small-payload Receive variant used by Skylanders: Spyro's Adventure
+     * (the first Skylanders 3DS title). SSA's IR wrapper at code.bin
+     * 0x0020181c populates a static-buffer descriptor at TLS[0x180] with
+     * (size << 14) | 2 and the destination at TLS[0x184], then dispatches
+     * command 0x000F. Stock Azahar had this entry as nullptr, so the call
+     * silently no-op'd and SSA never received any portal packet bytes.
+     */
+    void ReceiveIrnop(Kernel::HLERequestContext& ctx);
+
     /**
      * ReleaseReceivedData function
      * Release a specified amount of packet from the receive buffer. This is called after the
@@ -165,15 +185,24 @@ private:
      *  Outputs:
      *      1 : Result of function, 0 on success, otherwise error code
      */
+
+    void GetLatestReceiveErrorResult(Kernel::HLERequestContext& ctx);
+
+    void GetLatestSendErrorResult(Kernel::HLERequestContext& ctx);
+
     void ReleaseReceivedData(Kernel::HLERequestContext& ctx);
 
     void PutToReceive(std::span<const u8> payload);
 
     std::shared_ptr<Kernel::Event> conn_status_event, send_event, receive_event;
     std::shared_ptr<Kernel::SharedMemory> shared_memory;
-    bool connected_device;
+    bool connected_circle_pad;
+    bool connected_portal;
+    bool connected_infinity_base = false;
     std::unique_ptr<BufferManager> receive_buffer;
     std::unique_ptr<ExtraHID> extra_hid;
+    std::unique_ptr<IRPortal> ir_portal;
+    std::unique_ptr<IRInfinityBase> ir_infinity_base;
 
 private:
     template <class Archive>

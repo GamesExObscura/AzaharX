@@ -334,6 +334,12 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/service/ir/extra_hid.h
     hle/service/ir/ir.cpp
     hle/service/ir/ir.h
+    hle/service/ir/ir_infinity_base.cpp
+    hle/service/ir/ir_infinity_base.h
+    hle/service/ir/infinity_crypto.cpp
+    hle/service/ir/infinity_crypto.h
+    hle/service/ir/ir_portal.cpp
+    hle/service/ir/ir_portal.h
     hle/service/ir/ir_rst.cpp
     hle/service/ir/ir_rst.h
     hle/service/ir/ir_u.cpp

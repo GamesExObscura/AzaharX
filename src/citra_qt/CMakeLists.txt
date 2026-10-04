@@ -140,6 +140,10 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     game_list_worker.h
     hotkeys.cpp
     hotkeys.h
+    infrared/infinitybase/infinity_dialog.cpp
+    infrared/infinitybase/infinity_dialog.h
+    infrared/skylanderportal/skylander_dialog.cpp
+    infrared/skylanderportal/skylander_dialog.h
     loading_screen.cpp
     loading_screen.h
     loading_screen.ui

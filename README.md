@@ -38,7 +38,7 @@ with or endorsed by the Azahar team.
 ## Use the OpenGL renderer
 
 AzaharX's fixes were tested with **OpenGL**, and some of them exist only in the
-OpenGL renderer. On Vulkan, these games still do not render properly:
+OpenGL renderer.
 
 To switch: **Emulation → Configure → Graphics → Graphics API → OpenGL**.
 

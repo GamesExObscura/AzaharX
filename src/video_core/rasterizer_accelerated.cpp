@@ -5,6 +5,7 @@
 #include "common/alignment.h"
 #include "common/math_util.h"
 #include "core/memory.h"
+#include "common/hacks/hack_manager.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/rasterizer_accelerated.h"
 

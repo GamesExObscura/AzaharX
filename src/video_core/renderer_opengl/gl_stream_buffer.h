@@ -32,6 +32,15 @@ public:
 
     void Unmap(GLsizeiptr size);
 
+    /// True when Map(size, alignment) would wrap to the start and invalidate the buffer.
+    bool WouldWrap(GLsizeiptr size, GLintptr alignment) const {
+        GLintptr pos = buffer_pos;
+        if (alignment > 0) {
+            pos = (pos + alignment - 1) / alignment * alignment;
+        }
+        return pos + size > buffer_size;
+    }
+
 private:
     OGLBuffer gl_buffer;
     GLenum gl_target;

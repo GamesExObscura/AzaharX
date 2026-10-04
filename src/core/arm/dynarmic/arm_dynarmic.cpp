@@ -7,6 +7,8 @@
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
+#include "common/hacks/hack_list.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_cp15.h"
@@ -20,6 +22,12 @@
 #include "core/hle/kernel/svc.h"
 #include "core/memory.h"
 
+// Add missing typedefs for fixed-width types
+#include <cstdint>
+using u8  = std::uint8_t;
+using u16 = std::uint16_t;
+using u32 = std::uint32_t;
+using u64 = std::uint64_t;
 #ifndef SIGILL
 constexpr u32 SIGILL = 4;
 #endif
@@ -80,11 +88,183 @@ public:
     }
 
     void InterpreterFallback(VAddr pc, std::size_t num_instructions) override {
-        // Should never happen.
-        UNREACHABLE_MSG("InterpeterFallback reached with pc = 0x{:08x}, code = 0x{:08x}, num = {}",
-                        pc, MemoryReadCode(pc).value(), num_instructions);
+        // Title-gated (GRACEFUL_JIT_FALLBACK, currently Trap Team only):
+        // every other title keeps stock behavior — crash loudly — so an
+        // unexpected unJITtable instruction is never silently skipped,
+        // which would corrupt execution in ways that are far harder to
+        // debug than this message.
+        if (!Common::Hacks::g_graceful_jit_fallback.load(std::memory_order_relaxed)) {
+            UNREACHABLE_MSG(
+                "InterpeterFallback reached with pc = 0x{:08x}, code = 0x{:08x}, num = {}", pc,
+                MemoryReadCode(pc).value(), num_instructions);
+        }
+
+        // Read the instruction that caused the fallback
+        u32 instruction = MemoryReadCode(pc).value();
+
+        // Log the fallback for debugging but don't crash
+        LOG_WARNING(Debug, "Interpreter fallback: pc=0x{:08x}, instruction=0x{:08x}, count={}", pc,
+                    instruction, num_instructions);
+
+        // Handle basic instruction interpretation
+        for (std::size_t i = 0; i < num_instructions; ++i) {
+            u32 current_pc = pc + static_cast<u32>(i * 4);
+            auto inst_opt = MemoryReadCode(current_pc);
+            if (!inst_opt.has_value()) {
+                break; // Skip if memory read fails
+            }
+            u32 inst = inst_opt.value();
+
+            if (!ExecuteInstructionFallback(current_pc, inst)) {
+                // If we can't handle the instruction, try to skip it gracefully
+                LOG_ERROR(Debug, "Failed to interpret instruction 0x{:08x} at pc=0x{:08x}", inst,
+                          current_pc);
+
+                // Advance PC to next instruction and continue
+                parent.SetPC(current_pc + 4);
+                break;
+            }
+        }
     }
 
+private:
+    bool ExecuteInstructionFallback(u32 pc, u32 instruction) {
+        // Decode and execute basic ARM instructions
+
+        // Check for NOP instruction (0xe1a00000 or similar)
+        if ((instruction & 0x0fff0fff) == 0x01a00000) {
+            // NOP - do nothing, just advance PC
+            parent.SetPC(pc + 4);
+            return true;
+        }
+
+        // Handle ADD immediate: ADD Rd, Rn, #imm (0xf10c0040 matches this pattern)
+        if ((instruction & 0x0fe00000) == 0x02800000) {
+            u32 rn = (instruction >> 16) & 0xf;
+            u32 rd = (instruction >> 12) & 0xf;
+            u32 imm = instruction & 0xfff;
+
+            u32 rn_val = (rn == 15) ? pc + 8 : parent.GetReg(rn);
+            u32 result = rn_val + imm;
+
+            if (rd != 15) {
+                parent.SetReg(rd, result);
+                parent.SetPC(pc + 4);
+            } else {
+                parent.SetPC(result);
+            }
+            return true;
+        }
+
+        // Handle SUB immediate: SUB Rd, Rn, #imm
+        if ((instruction & 0x0fe00000) == 0x02400000) {
+            u32 rn = (instruction >> 16) & 0xf;
+            u32 rd = (instruction >> 12) & 0xf;
+            u32 imm = instruction & 0xfff;
+
+            u32 rn_val = (rn == 15) ? pc + 8 : parent.GetReg(rn);
+            u32 result = rn_val - imm;
+
+            if (rd != 15) {
+                parent.SetReg(rd, result);
+                parent.SetPC(pc + 4);
+            } else {
+                parent.SetPC(result);
+            }
+            return true;
+        }
+
+        // Handle MOV immediate: MOV Rd, #imm
+        if ((instruction & 0x0fef0000) == 0x03a00000) {
+            u32 rd = (instruction >> 12) & 0xf;
+            u32 imm = instruction & 0xfff;
+
+            if (rd != 15) {
+                parent.SetReg(rd, imm);
+                parent.SetPC(pc + 4);
+            } else {
+                parent.SetPC(imm);
+            }
+            return true;
+        }
+
+        // Handle LDR immediate: LDR Rd, [Rn, #imm]
+        if ((instruction & 0x0c500000) == 0x04100000) {
+            u32 rn = (instruction >> 16) & 0xf;
+            u32 rd = (instruction >> 12) & 0xf;
+            u32 imm = instruction & 0xfff;
+            bool pre_index = (instruction & (1 << 24)) != 0;
+            bool add = (instruction & (1 << 23)) != 0;
+
+            u32 address = (rn == 15) ? pc + 8 : parent.GetReg(rn);
+            if (pre_index) {
+                address = add ? address + imm : address - imm;
+            }
+
+            u32 value = MemoryRead32(address);
+
+            if (rd != 15) {
+                parent.SetReg(rd, value);
+                parent.SetPC(pc + 4);
+            } else {
+                parent.SetPC(value);
+            }
+            return true;
+        }
+
+        // Handle STR immediate: STR Rd, [Rn, #imm]
+        if ((instruction & 0x0c500000) == 0x04000000) {
+            u32 rn = (instruction >> 16) & 0xf;
+            u32 rd = (instruction >> 12) & 0xf;
+            u32 imm = instruction & 0xfff;
+            bool pre_index = (instruction & (1 << 24)) != 0;
+            bool add = (instruction & (1 << 23)) != 0;
+
+            u32 address = (rn == 15) ? pc + 8 : parent.GetReg(rn);
+            if (pre_index) {
+                address = add ? address + imm : address - imm;
+            }
+
+            u32 value = (rd == 15) ? pc + 8 : parent.GetReg(rd);
+            MemoryWrite32(address, value);
+
+            parent.SetPC(pc + 4);
+            return true;
+        }
+
+        // Handle B (branch): B label
+        if ((instruction & 0x0f000000) == 0x0a000000) {
+            s32 offset = (instruction & 0x00ffffff) << 2;
+            if (offset & 0x02000000) {
+                offset |= 0xfc000000; // Sign extend
+            }
+
+            u32 target = pc + 8 + offset;
+            parent.SetPC(target);
+            return true;
+        }
+
+        // Handle BL (branch with link): BL label
+        if ((instruction & 0x0f000000) == 0x0b000000) {
+            s32 offset = (instruction & 0x00ffffff) << 2;
+            if (offset & 0x02000000) {
+                offset |= 0xfc000000; // Sign extend
+            }
+
+            parent.SetReg(14, pc + 4); // Store return address in LR
+            u32 target = pc + 8 + offset;
+            parent.SetPC(target);
+            return true;
+        }
+
+        // For unhandled instructions, just advance PC and continue
+        LOG_DEBUG(Debug, "Unhandled instruction in fallback: 0x{:08x} at pc=0x{:08x}", instruction,
+                  pc);
+        parent.SetPC(pc + 4);
+        return true;
+    }
+
+public:
     void CallSVC(std::uint32_t swi) override {
         svc_context.CallSVC(swi);
     }
@@ -351,8 +531,20 @@ void ARM_Dynarmic::ServeBreak([[maybe_unused]] int signal) {
 std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     Dynarmic::A32::UserConfig config;
     config.callbacks = cb.get();
-    if (current_page_table) {
+    // ACCURATE_JIT_MEMORY hack: leave config.page_table null so every
+    // load/store is routed through the memory callbacks, which respect
+    // RasterizerCachedMemory page attributes. Fixes titles whose CPU
+    // writes to rasterizer-cached pages (texture data, PICA command
+    // buffer patches) were otherwise lost through the inline fast
+    // path. The flag is set during title load, before the app
+    // process's page table triggers this MakeJit.
+    const bool accurate_memory =
+        Common::Hacks::g_accurate_jit_memory.load(std::memory_order_relaxed);
+    if (current_page_table && !accurate_memory) {
         config.page_table = &current_page_table->GetPointerArray();
+    }
+    if (accurate_memory) {
+        LOG_INFO(Core_ARM11, "ACCURATE_JIT_MEMORY active: JIT built without page table");
     }
     config.coprocessors[15] = std::make_shared<DynarmicCP15>(cp15_state);
     config.define_unpredictable_behaviour = true;

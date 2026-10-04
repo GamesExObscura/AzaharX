@@ -2,9 +2,11 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cmath>
 #include <utility>
 #include "common/assert.h"
 #include "common/bit_set.h"
+#include "common/hacks/hack_list.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "video_core/pica/regs_shader.h"
@@ -37,7 +39,15 @@ std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 val
         return std::nullopt;
     }
 
-    const auto uniform = uniform_queue.Get(is_float32);
+    auto uniform = uniform_queue.Get(is_float32);
+    // FLOAT_UNIFORM_NAN_TO_ZERO (title-gated): see the HackType comment.
+    if (is_float32 && Common::Hacks::g_float_uniform_nan_to_zero.load(std::memory_order_relaxed)) {
+        for (std::size_t i = 0; i < 4; ++i) {
+            if (std::isnan(uniform[i].ToFloat32())) {
+                uniform[i] = f24::Zero();
+            }
+        }
+    }
     if (uniform_setup.index >= uniforms.f.size()) {
         LOG_ERROR(HW_GPU, "Invalid float uniform index {}", uniform_setup.index.Value());
         return std::nullopt;

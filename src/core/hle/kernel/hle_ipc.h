@@ -14,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
+#include "common/hacks/hack_list.h"
 #include "common/serialization/boost_small_vector.hpp"
 #include "common/settings.h"
 #include "common/swap.h"
@@ -139,6 +140,13 @@ public:
 
     u32 GetId() const {
         return id;
+    }
+
+    // SSA-DIAG: expose the guest VA for read-after-write verification.
+    // Bypasses Read()'s perms ASSERT so we can confirm a Write actually
+    // landed in client memory even when the descriptor is W-only.
+    VAddr DebugGetAddress() const {
+        return address;
     }
 
 private:
@@ -305,14 +313,28 @@ public:
 
         if (!Settings::values.deterministic_async_operations && really_async) {
             kernel.ReportAsyncState(true);
-            this->SleepClientThread(
-                "RunAsync", std::chrono::nanoseconds(-1),
-                std::make_shared<AsyncWakeUpCallback<ResultFunctor>>(
-                    kernel, result_function,
-                    std::move(std::async(std::launch::async, [this, async_section] {
-                        s64 sleep_for = async_section(*this);
-                        this->thread->WakeAfterDelay(sleep_for, true);
-                    }))));
+            std::future<void> task;
+            if (Common::Hacks::g_async_wake_shutdown_guard.load(std::memory_order_relaxed)) {
+                // ASYNC_WAKE_SHUTDOWN_GUARD (title-gated) — see KernelSystem::AsyncWakeGuard.
+                // A task that finishes after Stop must not wake its thread: the kernel and the
+                // timing system it would schedule onto are already destroyed.
+                task = std::async(std::launch::async,
+                                  [this, async_section, guard = kernel.GetAsyncWakeGuard()] {
+                                      s64 sleep_for = async_section(*this);
+                                      std::scoped_lock lock{guard->mutex};
+                                      if (guard->alive) {
+                                          this->thread->WakeAfterDelay(sleep_for, true);
+                                      }
+                                  });
+            } else {
+                task = std::async(std::launch::async, [this, async_section] {
+                    s64 sleep_for = async_section(*this);
+                    this->thread->WakeAfterDelay(sleep_for, true);
+                });
+            }
+            this->SleepClientThread("RunAsync", std::chrono::nanoseconds(-1),
+                                    std::make_shared<AsyncWakeUpCallback<ResultFunctor>>(
+                                        kernel, result_function, std::move(task)));
 
         } else {
             s64 sleep_for = async_section(*this);

@@ -348,6 +348,10 @@ public:
     RegsLcd regs_lcd{};
     Regs regs{};
     DirtyRegs dirty_regs{};
+    /// DRAW_LOOKUP_REUSE: counts register and LUT writes that change render state, excluding the
+    /// per-draw vertex registers (see IsDrawMergeNeutralReg). The OpenGL rasterizer merges
+    /// consecutive draws only while this is unchanged.
+    u64 draw_merge_breaks = 0;
     GeometryShaderUnit gs_unit;
     ShaderSetup vs_setup;
     ShaderSetup gs_setup;
@@ -379,6 +383,7 @@ private:
         ar & cmd_list;
         if (Archive::is_loading::value) {
             dirty_regs.SetAllDirty();
+            ++draw_merge_breaks;
         }
     }
 

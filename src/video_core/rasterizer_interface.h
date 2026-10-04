@@ -90,8 +90,28 @@ public:
         accurate_mul = accurate_mul_;
     }
 
+    void SetNormalizeVertexColors(bool normalize) {
+        normalize_vertex_colors = normalize;
+    }
+
+    bool GetNormalizeVertexColors() const {
+        return normalize_vertex_colors;
+    }
+
+    void SetMidGrayEtc1Fallback(bool enable) {
+        mid_gray_etc1_fallback = enable;
+    }
+
+    bool GetMidGrayEtc1Fallback() const {
+        return mid_gray_etc1_fallback;
+    }
+
+
 protected:
     bool accurate_mul = false;
+    bool normalize_vertex_colors = false;
+    bool mid_gray_etc1_fallback = false;
+
 
     // Rasterizer gets destroyed on reboot, so make the callback
     // static until a better solution is found.

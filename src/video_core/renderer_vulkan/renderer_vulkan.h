@@ -131,6 +131,12 @@ private:
     RenderManager renderpass_cache;
     PresentWindow main_present_window;
     StreamBuffer vertex_buffer;
+    // Staging buffer for the LoadFBToScreenInfo CPU-upload fallback
+    // path. Used when AccelerateDisplay fails during scene transitions
+    // (loading→gameplay etc.) so we can upload raw framebuffer bytes
+    // into the screen texture the same way the OpenGL renderer does,
+    // instead of re-presenting whatever stale content the texture had.
+    StreamBuffer fb_upload_buffer;
     DescriptorUpdateQueue update_queue;
     RasterizerVulkan rasterizer;
     std::unique_ptr<PresentWindow> secondary_present_window_ptr;

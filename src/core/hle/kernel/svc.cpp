@@ -3,10 +3,13 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
+#include <unordered_map>
 #include <fmt/format.h>
 #include "common/archives.h"
+#include "common/hacks/hack_list.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/scm_rev.h"
@@ -419,6 +422,10 @@ private:
     u32 GetReg(std::size_t n);
     void SetReg(std::size_t n, u32 value);
 
+    /// JAWS_ENTITY_UNLINK: installs the two guest hooks and services their SVCs.
+    /// Returns true when `immediate` was one of the hook SVCs and has been handled.
+    bool JawsEntityUnlinkHook(u32 immediate);
+
     // SVC interfaces
 
     Result ControlMemory(u32* out_addr, u32 addr0, u32 addr1, u32 size, u32 operation,
@@ -440,6 +447,9 @@ private:
     Result InvalidateProcessDataCache(Handle process_handle, VAddr address, u32 size);
     Result StoreProcessDataCache(Handle process_handle, VAddr address, u32 size);
     Result FlushProcessDataCache(Handle process_handle, VAddr address, u32 size);
+    Result StartInterProcessDma(Handle* out_handle, Handle dst_process_handle, VAddr dst_addr,
+                                Handle src_process_handle, VAddr src_addr, u32 size,
+                                u32 dma_config_ptr);
     Result CreateAddressArbiter(Handle* out_handle);
     Result ArbitrateAddress(Handle handle, u32 address, u32 type, u32 value, s64 nanoseconds);
     void Break(u8 break_reason);
@@ -808,6 +818,13 @@ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
     if (object->ShouldWait(thread)) {
         R_UNLESS(nano_seconds != 0, ResultTimeout);
 
+        // KERNEL_WAIT_DIAG: record which object this thread parks on.
+        if (Common::Hacks::g_kernel_wait_diag.load(std::memory_order_relaxed)) {
+            LOG_INFO(Kernel_SVC, "[KWAIT] tid={} WS1 block h=0x{:08X} {}:{} timeout_ns={}",
+                     thread->GetThreadId(), handle, object->GetTypeName(), object->GetName(),
+                     nano_seconds);
+        }
+
         thread->wait_objects = {object};
         object->AddWaitingThread(SharedFrom(thread));
         thread->status = ThreadStatus::WaitSynchAny;
@@ -872,6 +889,18 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
         // suspending the thread.
         R_UNLESS(nano_seconds != 0, ResultTimeout);
 
+        // KERNEL_WAIT_DIAG: record which objects this thread parks on.
+        if (Common::Hacks::g_kernel_wait_diag.load(std::memory_order_relaxed)) {
+            std::string objs;
+            for (int i = 0; i < handle_count; ++i) {
+                objs += fmt::format(" 0x{:08X}={}:{}",
+                                    memory.Read32(handles_address + i * sizeof(Handle)),
+                                    objects[i]->GetTypeName(), objects[i]->GetName());
+            }
+            LOG_INFO(Kernel_SVC, "[KWAIT] tid={} WSN block ALL n={} timeout_ns={} objs:{}",
+                     thread->GetThreadId(), handle_count, nano_seconds, objs);
+        }
+
         // Put the thread to sleep
         thread->status = ThreadStatus::WaitSynchAll;
 
@@ -913,6 +942,18 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
         // If a timeout value of 0 was provided, just return the Timeout error code instead of
         // suspending the thread.
         R_UNLESS(nano_seconds != 0, ResultTimeout);
+
+        // KERNEL_WAIT_DIAG: record which objects this thread parks on.
+        if (Common::Hacks::g_kernel_wait_diag.load(std::memory_order_relaxed)) {
+            std::string objs;
+            for (int i = 0; i < handle_count; ++i) {
+                objs += fmt::format(" 0x{:08X}={}:{}",
+                                    memory.Read32(handles_address + i * sizeof(Handle)),
+                                    objects[i]->GetTypeName(), objects[i]->GetName());
+            }
+            LOG_INFO(Kernel_SVC, "[KWAIT] tid={} WSN block ANY n={} timeout_ns={} objs:{}",
+                     thread->GetThreadId(), handle_count, nano_seconds, objs);
+        }
 
         // Put the thread to sleep
         thread->status = ThreadStatus::WaitSynchAny;
@@ -1109,6 +1150,55 @@ Result SVC::FlushProcessDataCache(Handle process_handle, VAddr address, u32 size
     return ResultSuccess;
 }
 
+/// Starts an inter-process DMA copy: copies `size` bytes from `src_process`'s
+/// `src_addr` to `dst_process`'s `dst_addr`. Previously stubbed as nullptr in the
+/// SVC table, which meant any game using this SVC to populate VRAM (e.g. Disney
+/// Princess: My Fairytale Adventure's character-creator textures at 0x18594900)
+/// silently did nothing — destination memory stayed at zeros. Implementation
+/// reads bytes through one process's memory view and writes them through the
+/// other process's view, which routes through MemorySystem::Write{Block} and
+/// triggers RasterizerCache invalidation for any cached destination surface.
+/// The DMA "handle" returned here is fake (0) — we complete synchronously and
+/// don't expose a polling/cancel interface yet. Games that call StopDma/
+/// GetDmaState/RestartDma on the returned handle will continue to no-op
+/// (those SVCs are still nullptr in the table). For the texture-upload use case
+/// this is fine because the copy is already complete when the SVC returns.
+Result SVC::StartInterProcessDma(Handle* out_handle, Handle dst_process_handle, VAddr dst_addr,
+                                 Handle src_process_handle, VAddr src_addr, u32 size,
+                                 u32 dma_config_ptr) {
+    LOG_DEBUG(Kernel_SVC,
+              "called dst_proc=0x{:X} dst_addr=0x{:08X} src_proc=0x{:X} src_addr=0x{:08X} "
+              "size=0x{:X} cfg=0x{:08X}",
+              dst_process_handle, dst_addr, src_process_handle, src_addr, size, dma_config_ptr);
+
+    const auto& current_process = kernel.GetCurrentProcess();
+    std::shared_ptr<Process> dst_process =
+        current_process->handle_table.Get<Process>(dst_process_handle);
+    std::shared_ptr<Process> src_process =
+        current_process->handle_table.Get<Process>(src_process_handle);
+    R_UNLESS(dst_process && src_process, ResultInvalidHandle);
+
+    if (size == 0) {
+        if (out_handle) *out_handle = 0;
+        return ResultSuccess;
+    }
+
+    // Stage the source bytes into a temporary buffer (handles both same-process
+    // and cross-process copies uniformly, and lets us go through WriteBlock on
+    // the destination side so RasterizerCachedMemory pages get invalidated).
+    std::vector<u8> staging(size);
+    memory.ReadBlock(*src_process, src_addr, staging.data(), size);
+    memory.WriteBlock(*dst_process, dst_addr, staging.data(), size);
+
+    // Return a fake DMA handle. Real hardware returns a handle that can be
+    // waited on for completion; since our impl is synchronous, callers that
+    // wait on the handle immediately will see "complete" semantics.
+    if (out_handle) {
+        *out_handle = 0;
+    }
+    return ResultSuccess;
+}
+
 /// Create an address arbiter (to allocate access to shared resources)
 Result SVC::CreateAddressArbiter(Handle* out_handle) {
     // Update address arbiter count in resource limit.
@@ -1133,6 +1223,16 @@ Result SVC::ArbitrateAddress(Handle handle, u32 address, u32 type, u32 value, s6
     std::shared_ptr<AddressArbiter> arbiter =
         kernel.GetCurrentProcess()->handle_table.Get<AddressArbiter>(handle);
     R_UNLESS(arbiter, ResultInvalidHandle);
+
+    // KERNEL_WAIT_DIAG: log all arbitrations — type 0 = signal (wake),
+    // types 1-4 = wait variants — plus the current value at the address,
+    // which decides whether the wait variants actually block.
+    if (Common::Hacks::g_kernel_wait_diag.load(std::memory_order_relaxed)) {
+        LOG_INFO(Kernel_SVC,
+                 "[KWAIT] tid={} Arb type={} addr=0x{:08X} val={} cur={} timeout_ns={}",
+                 kernel.GetCurrentThreadManager().GetCurrentThread()->GetThreadId(), type, address,
+                 static_cast<s32>(value), static_cast<s32>(memory.Read32(address)), nanoseconds);
+    }
 
     auto res =
         arbiter->ArbitrateAddress(SharedFrom(kernel.GetCurrentThreadManager().GetCurrentThread()),
@@ -1565,6 +1665,13 @@ Result SVC::SignalEvent(Handle handle) {
 
     std::shared_ptr<Event> evt = kernel.GetCurrentProcess()->handle_table.Get<Event>(handle);
     R_UNLESS(evt, ResultInvalidHandle);
+
+    // KERNEL_WAIT_DIAG: make game-side wakes visible alongside the waits.
+    if (Common::Hacks::g_kernel_wait_diag.load(std::memory_order_relaxed)) {
+        LOG_INFO(Kernel_SVC, "[KWAIT] tid={} SignalEvent h=0x{:08X} {}:{}",
+                 kernel.GetCurrentThreadManager().GetCurrentThread()->GetThreadId(), handle,
+                 evt->GetTypeName(), evt->GetName());
+    }
 
     evt->Signal();
     return ResultSuccess;
@@ -2316,7 +2423,7 @@ const std::array<SVC::FunctionDef, 180> SVC::SVC_Table{{
     {0x52, &SVC::Wrap<&SVC::InvalidateProcessDataCache, 0x52>, "InvalidateProcessDataCache", 9609},
     {0x53, &SVC::Wrap<&SVC::StoreProcessDataCache, 0x53>, "StoreProcessDataCache", 7174},
     {0x54, &SVC::Wrap<&SVC::FlushProcessDataCache, 0x54>, "FlushProcessDataCache", 9084},
-    {0x55, nullptr, "StartInterProcessDma", 9146},
+    {0x55, &SVC::Wrap<&SVC::StartInterProcessDma, 0x55>, "StartInterProcessDma", 9146},
     {0x56, nullptr, "StopDma", 1163},
     {0x57, nullptr, "GetDmaState", 2222},
     {0x58, nullptr, "RestartDma", 8096},
@@ -2437,6 +2544,13 @@ void SVC::CallSVC(u32 immediate) {
     DEBUG_ASSERT_MSG(kernel.GetCurrentProcess()->status == ProcessStatus::Running,
                      "Running threads from exiting processes is unimplemented");
 
+    // JAWS_ENTITY_UNLINK (title-gated) — see HackType::JAWS_ENTITY_UNLINK.
+    if (Common::Hacks::g_jaws_entity_unlink.load(std::memory_order_relaxed) &&
+        JawsEntityUnlinkHook(immediate)) {
+        system.perf_stats->EndSVCProcessing();
+        return;
+    }
+
     const FunctionDef* info = GetSVCInfo(immediate);
     LOG_TRACE(Kernel_SVC, "calling {}", info->name);
     if (info) {
@@ -2458,6 +2572,127 @@ u32 SVC::GetReg(std::size_t n) {
 
 void SVC::SetReg(std::size_t n, u32 value) {
     system.GetRunningCore().SetReg(static_cast<int>(n), value);
+}
+
+bool SVC::JawsEntityUnlinkHook(u32 immediate) {
+    // JAWS: Ultimate Predator (USA) .code addresses.
+    constexpr u64 jaws_program_id = 0x0004000000048600;
+    constexpr VAddr list_walk = 0x00204B50;       // push {r4, r5, r6, lr}
+    constexpr u32 list_walk_insn = 0xE92D4070;
+    constexpr VAddr entity_dtor = 0x0021EAB8;     // ldr r1, [pc, #204]
+    constexpr u32 entity_dtor_insn = 0xE59F10CC;
+    constexpr VAddr entity_dtor_literal = 0x0021EB8C; // = 0x003E4384, the entity vtable
+    constexpr u32 svc_list_walk = 0xFD;
+    constexpr u32 svc_entity_dtor = 0xFE;
+
+    // Every child list the walk at 0x204B50 has visited: container address -> its vtable word
+    // when first seen (a changed vtable means the container was freed or reused).
+    static u32 hooked_process_id = 0xFFFFFFFF;
+    static std::unordered_map<VAddr, u32> lists;
+    static bool warned = false;
+
+    const auto process = kernel.GetCurrentProcess();
+    if (!process || !process->codeset || process->codeset->program_id != jaws_program_id) {
+        return false;
+    }
+
+    if (process->process_id != hooked_process_id) {
+        hooked_process_id = process->process_id;
+        lists.clear();
+        warned = false;
+    }
+    // (Re)install whenever the original code is present: at boot, and after a save state made
+    // without the hooks restores the unpatched words.
+    if (immediate != svc_list_walk && immediate != svc_entity_dtor) {
+        const u32 walk_word = memory.Read32(list_walk);
+        const u32 dtor_word = memory.Read32(entity_dtor);
+        if (walk_word == list_walk_insn && dtor_word == entity_dtor_insn) {
+            memory.Write32(list_walk, 0xEF000000 | svc_list_walk);
+            memory.Write32(entity_dtor, 0xEF000000 | svc_entity_dtor);
+            system.InvalidateCacheRange(list_walk, 4);
+            system.InvalidateCacheRange(entity_dtor, 4);
+            lists.clear();
+            LOG_INFO(Kernel_SVC, "[ENTITY-UNLINK] hooks installed at 0x{:08X} and 0x{:08X}",
+                     list_walk, entity_dtor);
+        } else if (!warned && (walk_word != (0xEF000000 | svc_list_walk) ||
+                               dtor_word != (0xEF000000 | svc_entity_dtor))) {
+            warned = true;
+            LOG_WARNING(Kernel_SVC,
+                        "[ENTITY-UNLINK] not installed: unexpected code 0x{:08X} / 0x{:08X}",
+                        walk_word, dtor_word);
+        }
+        return false;
+    }
+
+    auto valid = [&](VAddr address) { return memory.IsValidVirtualAddress(*process, address); };
+    // A list is a container object whose child pointers live in [+20, +24).
+    auto read_vector = [&](VAddr list, u32& begin, u32& end) {
+        if (!valid(list) || !valid(list + 24)) {
+            return false;
+        }
+        begin = memory.Read32(list + 20);
+        end = memory.Read32(list + 24);
+        return begin <= end && ((end - begin) & 3) == 0 && (end - begin) / 4 <= 4096 &&
+               (begin == end || (valid(begin) && valid(end - 4)));
+    };
+
+    if (immediate == svc_list_walk) {
+        // Emulate the replaced push {r4, r5, r6, lr}.
+        const VAddr sp = GetReg(13) - 16;
+        memory.Write32(sp, GetReg(4));
+        memory.Write32(sp + 4, GetReg(5));
+        memory.Write32(sp + 8, GetReg(6));
+        memory.Write32(sp + 12, GetReg(14));
+        SetReg(13, sp);
+
+        // Remember every walked list, whatever it holds right now: a list can receive entities
+        // and lose one to the steal path between two walks.
+        const VAddr list = GetReg(0);
+        if (!lists.contains(list) && valid(list)) {
+            lists.emplace(list, memory.Read32(list));
+        }
+        return true;
+    }
+
+    if (immediate == svc_entity_dtor) {
+        // Emulate the replaced ldr r1, [pc, #204].
+        SetReg(1, memory.Read32(entity_dtor_literal));
+
+        // Unlink the dying entity from every tracked list before the game frees it. The game's
+        // effect-slot steal path (0x2A3EE8 -> 0x2A0568 -> 0x2A0674) deletes entities that are
+        // still in a list the main loop walks at 0x204B50, which then calls into freed memory.
+        const VAddr entity = GetReg(0);
+        for (auto it = lists.begin(); it != lists.end();) {
+            const VAddr list = it->first;
+            u32 begin = 0, end = 0;
+            if (!valid(list) || memory.Read32(list) != it->second ||
+                !read_vector(list, begin, end)) {
+                it = lists.erase(it); // the container itself is gone or reused
+                continue;
+            }
+            VAddr out = begin;
+            for (VAddr in = begin; in < end; in += 4) {
+                const u32 child = memory.Read32(in);
+                if (child == entity) {
+                    continue;
+                }
+                if (out != in) {
+                    memory.Write32(out, child);
+                }
+                out += 4;
+            }
+            if (out != end) {
+                memory.Write32(list + 24, out);
+                LOG_INFO(Kernel_SVC,
+                         "[ENTITY-UNLINK] removed destroyed entity 0x{:08X} from list 0x{:08X}",
+                         entity, list);
+            }
+            ++it;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 SVCContext::SVCContext(Core::System& system) : impl(std::make_unique<SVC>(system)) {}

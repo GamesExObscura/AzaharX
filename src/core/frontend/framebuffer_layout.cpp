@@ -55,8 +55,22 @@ static Common::Rectangle<T> MaxRectangle(Common::Rectangle<T> bounding_window,
 }
 
 FramebufferLayout DefaultFrameLayout(u32 width, u32 height, bool swapped, bool upright) {
-    return LargeFrameLayout(width, height, swapped, upright, 1.0f,
-                            Settings::SmallScreenPosition::BelowLarge);
+    FramebufferLayout res = LargeFrameLayout(width, height, swapped, upright, 1.0f,
+                                             Settings::SmallScreenPosition::BelowLarge);
+    // [LAYOUT] runtime-diff probe vs Citra 2104 — the emulated framebuffers
+    // are proven pixel-identical, so a displaced screen must come from these
+    // window rectangles.
+    static u32 lay_tick = 0;
+    if ((lay_tick++ % 60) == 0) {
+        LOG_INFO(Render, "[LAYOUT] win={}x{} swapped={} upright={} | top=({},{})-({},{}) {}x{} | "
+                         "bottom=({},{})-({},{}) {}x{}",
+                 res.width, res.height, swapped, upright, res.top_screen.left, res.top_screen.top,
+                 res.top_screen.right, res.top_screen.bottom, res.top_screen.GetWidth(),
+                 res.top_screen.GetHeight(), res.bottom_screen.left, res.bottom_screen.top,
+                 res.bottom_screen.right, res.bottom_screen.bottom, res.bottom_screen.GetWidth(),
+                 res.bottom_screen.GetHeight());
+    }
+    return res;
 }
 
 FramebufferLayout PortraitTopFullFrameLayout(u32 width, u32 height, bool swapped, bool upright) {

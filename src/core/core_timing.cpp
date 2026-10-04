@@ -6,6 +6,7 @@
 #include <random>
 #include <tuple>
 #include "common/assert.h"
+#include "common/hacks/hack_list.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
@@ -29,6 +30,7 @@ Timing::Timing(std::size_t num_cores, u32 cpu_clock_percentage, s64 override_bas
     timers.resize(num_cores);
     for (std::size_t i = 0; i < num_cores; ++i) {
         timers[i] = std::make_shared<Timer>(base_ticks);
+        timers[i]->core_index = i;
     }
     UpdateClockSpeed(cpu_clock_percentage);
     current_timer = timers[0].get();
@@ -243,6 +245,14 @@ void Timing::Timer::SetNextSlice(s64 max_slice_length) {
     }
 
     downcount = slice_length;
+
+    // CORE_DOWNCOUNT_HACK (title-gated, Zeusiota/MMJ): run the core for only
+    // a fraction of the slice while time still advances by the full slice —
+    // a per-core CPU throttle (MMJ SetCpuUsageLimit shifts {1,4,2,2}).
+    if (Common::Hacks::g_core_downcount_hack.load(std::memory_order_relaxed)) {
+        static constexpr u32 shifts[4] = {1, 4, 2, 2};
+        downcount = slice_length >> shifts[core_index < 4 ? core_index : 0];
+    }
 }
 
 void Timing::Timer::Idle() {

@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <array>
+#include <atomic>
 #include <csignal>
 #include <cstring>
 #include <boost/serialization/array.hpp>
@@ -11,6 +12,7 @@
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/atomic_ops.h"
+#include "common/hacks/hack_list.h"
 #include "common/common_types.h"
 #include "common/logging/log.h"
 #include "common/optional_helper.h"

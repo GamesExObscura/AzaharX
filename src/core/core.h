@@ -524,6 +524,8 @@ private:
     bool mic_permission_granted = false;
 
     boost::optional<Service::APT::DeliverArg> restore_deliver_arg;
+    // Title-gated: see HackType::PRESERVE_APP_JUMP_PARAMS.
+    boost::optional<Service::APT::ApplicationJumpParameters> restore_app_jump_parameters;
     boost::optional<Service::APT::SysMenuArg> restore_sys_menu_arg;
     boost::optional<Service::PLGLDR::PLG_LDR::PluginLoaderContext> restore_plugin_context;
     std::unique_ptr<IPCDebugger::Recorder> restore_ipc_recorder;

@@ -8,6 +8,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
 #include "common/alignment.h"
+#include "common/hacks/hack_list.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
@@ -135,6 +136,7 @@ void RasterizerCache<T>::RunGarbageCollector() {
             it++;
             continue;
         }
+        ++mutation_gen;
         RemoveFramebuffers(surface_id);
         slot_surfaces.erase(surface_id);
         it = sentenced.erase(it);
@@ -146,6 +148,7 @@ void RasterizerCache<T>::RemoveFramebuffers(SurfaceId surface_id) {
     for (auto it = framebuffers.begin(); it != framebuffers.end();) {
         const auto& params = it->first;
         if (params.color_id == surface_id || params.depth_id == surface_id) {
+            ++mutation_gen;
             slot_framebuffers.erase(it->second);
             it = framebuffers.erase(it);
         } else {
@@ -337,6 +340,26 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
 
     if (!CheckFormatsBlittable(src_surface.pixel_format, dst_surface.pixel_format)) {
         return false;
+    }
+
+    // FB_CONFIG_DIAG (log only): how did the cache resolve the source
+    // window? Games that render both screens into ONE target blit
+    // overlapping sub-rects out of it (7th Dragon / Samus Returns: the
+    // bottom source sits exactly 80 rows into the top target). If the
+    // resolved surface base is not the shared target, or src_rect's
+    // origin does not match the requested offset, the presented image is
+    // displaced by that difference — the screen-shift signature.
+    if (Common::Hacks::g_fb_config_diag.load(std::memory_order_relaxed)) {
+        static u32 sr_tick = 0;
+        if ((sr_tick++ % 101) < 4) {
+            LOG_INFO(HW_GPU,
+                     "[SUBRECT] req_src=0x{:08X} -> surf=0x{:08X} lvl={} src_rect=({},{})-({},{}) "
+                     "| req_dst=0x{:08X} -> surf=0x{:08X} dst_rect=({},{})-({},{})",
+                     src_params.addr, src_surface.addr,
+                     src_surface.LevelOf(src_params.addr), src_rect.left, src_rect.bottom,
+                     src_rect.right, src_rect.top, dst_params.addr, dst_surface.addr,
+                     dst_rect.left, dst_rect.bottom, dst_rect.right, dst_rect.top);
+        }
     }
 
     const TextureBlit texture_blit = {
@@ -550,6 +573,11 @@ typename RasterizerCache<T>::SurfaceRect_Tuple RasterizerCache<T>::GetSurfaceSub
 template <class T>
 typename T::Surface& RasterizerCache<T>::GetTextureSurface(
     const Pica::TexturingRegs::FullTextureConfig& config) {
+    if (config.config.GetPhysicalAddress() == 0) {
+        LOG_ERROR(HW_GPU, "GetTextureSurface (config) called with NULL address!");
+        return slot_surfaces[NULL_SURFACE_ID];
+    }
+
     const auto info = Pica::Texture::TextureInfo::FromPicaRegister(config.config, config.format);
     const u32 max_level = MipLevels(info.width, info.height, config.config.lod.max_level) - 1;
     const SurfaceId surface_id = GetTextureSurface(info, max_level);
@@ -560,14 +588,14 @@ template <class T>
 SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo& info,
                                                 u32 max_level) {
     if (info.physical_address == 0) [[unlikely]] {
-        // Can occur when texture addr is null or its memory is unmapped/invalid
-        // HACK: In this case, the correct behaviour for the PICA is to use the last
-        // rendered colour. But because this would be impractical to implement, the
-        // next best alternative is to use a clear texture, essentially skipping
-        // the geometry in question.
-        // For example: a bug in Pokemon X/Y causes NULL-texture squares to be drawn
-        // on the male character's face, which in the OpenGL default appear black.
+        LOG_ERROR(HW_GPU, "GetTextureSurface called with NULL address! size={}x{} format={}",
+                  info.width, info.height, static_cast<u32>(info.format));
         return NULL_SURFACE_ID;
+
+    if (info.width == 0 || info.height == 0) {
+    return NULL_SURFACE_ID;
+        }
+
     }
 
     SurfaceParams params;
@@ -712,6 +740,26 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
     const s32 framebuffer_width = config.GetWidth();
     const s32 framebuffer_height = config.GetHeight();
     const auto viewport_rect = regs.rasterizer.GetViewportRect();
+
+    // FB_CONFIG_DIAG (log only): per-draw viewport/scissor against the
+    // render target. A screen whose blit is a pixel-exact copy but still
+    // appears shifted must be shifted in the target itself — this shows
+    // whether the viewport corner or scissor window is offset.
+    if (Common::Hacks::g_fb_config_diag.load(std::memory_order_relaxed)) {
+        static u32 vp_tick = 0;
+        if ((vp_tick++ % 601) < 4) {
+            LOG_INFO(HW_GPU,
+                     "[VPORT] target=0x{:08X} fb={}x{} vp=({},{})-({},{}) scissor_mode={} "
+                     "sc=({},{})-({},{})",
+                     config.GetColorBufferPhysicalAddress(), framebuffer_width, framebuffer_height,
+                     viewport_rect.left, viewport_rect.bottom, viewport_rect.right,
+                     viewport_rect.top, static_cast<u32>(regs.rasterizer.scissor_test.mode.Value()),
+                     regs.rasterizer.scissor_test.x1.Value(),
+                     regs.rasterizer.scissor_test.y1.Value(),
+                     regs.rasterizer.scissor_test.x2.Value(),
+                     regs.rasterizer.scissor_test.y2.Value());
+        }
+    }
     const Common::Rectangle<u32> viewport_clamped = {
         static_cast<u32>(std::clamp(viewport_rect.left, 0, framebuffer_width)),
         static_cast<u32>(std::clamp(viewport_rect.top, 0, framebuffer_height)),
@@ -791,11 +839,45 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
 
     auto [it, new_framebuffer] = framebuffers.try_emplace(fb_params);
     if (new_framebuffer) {
+        ++mutation_gen;
+        // [FB-DIAG2] companion to the gl_texture_runtime FB-DIAG: when a
+        // framebuffer is created with NO surfaces at all (LEGO Harry Potter /
+        // LEGO SW Clone Wars black-screen class), record whether the caller
+        // asked for surfaces and what the PICA framebuffer config held, to
+        // separate masked-draw no-ops from surface-resolution failures.
+        if (!color_id && !depth_id && !fb_params.shadow_rendering) {
+            LOG_CRITICAL(HW_GPU,
+                         "[FB-DIAG2] null-surface framebuffer: using_color={} using_depth={} | "
+                         "color_addr=0x{:08X} color_fmt={} {}x{} | depth_addr=0x{:08X} depth_fmt={}",
+                         using_color_fb, using_depth_fb, config.GetColorBufferPhysicalAddress(),
+                         static_cast<u32>(config.color_format.Value()), framebuffer_width,
+                         framebuffer_height, config.GetDepthBufferPhysicalAddress(),
+                         static_cast<u32>(config.depth_format.Value()));
+        }
+        // FB_CONFIG_DIAG (log only): which render targets does the game
+        // actually draw into? For a title whose framebuffers are blitted
+        // correctly but arrive blank, this says whether the PICA ever
+        // renders into the VRAM source those blits read from.
+        if (Common::Hacks::g_fb_config_diag.load(std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU,
+                     "[FBTARGET] render target color=0x{:08X} fmt={} {}x{} color_resolved={} "
+                     "depth=0x{:08X}",
+                     config.GetColorBufferPhysicalAddress(),
+                     static_cast<u32>(config.color_format.Value()), framebuffer_width,
+                     framebuffer_height, color_id ? 1 : 0,
+                     config.GetDepthBufferPhysicalAddress());
+        }
         it->second = slot_framebuffers.insert(runtime, fb_params, color_surface, depth_surface);
     }
 
-    return FramebufferHelper<T>{this, &slot_framebuffers[it->second],
-                                regs.framebuffer.framebuffer.IsFlipped(), regs.rasterizer, fb_rect};
+    // FB_FLIP_RECT_DISABLE (title-gated): see the HackType comment — the
+    // flip-rect mirror relocates partial-height viewports inside taller
+    // shared render targets, shifting the affected screen.
+    const bool flip_rect =
+        regs.framebuffer.framebuffer.IsFlipped() &&
+        !Common::Hacks::g_fb_flip_rect_disable.load(std::memory_order_relaxed);
+    return FramebufferHelper<T>{this, &slot_framebuffers[it->second], flip_rect, regs.rasterizer,
+                                fb_rect};
 }
 
 template <class T>
@@ -975,8 +1057,10 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
     SurfaceRegions validate_regions = surface.invalid_regions & validate_interval;
 
     if (validate_regions.empty()) {
+        // Surface is fully valid - no upload needed.
         return;
     }
+    ++mutation_gen;
 
     auto notify_validated = [&](SurfaceInterval interval) {
         surface.MarkValid(interval);
@@ -1037,6 +1121,12 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
 
     const SurfaceParams load_info = surface.FromInterval(interval);
+    
+    if (load_info.addr == 0) {
+        LOG_ERROR(HW_GPU, "UploadSurface: NULL address! surface.addr=0x{:08X}", surface.addr);
+        return;
+    }
+
     ASSERT(load_info.addr >= surface.addr && load_info.end <= surface.end);
 
     const auto staging = runtime.FindStaging(
@@ -1048,15 +1138,101 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
     }
 
     const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
-    DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
+
+    // Mid-gray zero-texture fallback. Gated per-title via the hack manager
+    // (currently Disney Princess MFA). The game's CPU texture writes appear
+    // to bypass MemorySystem::Write (likely dynarmic JIT optimization
+    // copying to a host pointer that becomes stale once Citra marks the page
+    // RasterizerCachedMemory), so uploads read all-zero source bytes. The
+    // zero data manifests differently by format:
+    //   - ETC1 (opaque): TEV multiply chain collapses to zero, dress renders
+    //     as `const_color − 0.5` = dark olive. Fixed by substituting
+    //     mid-gray blocks (~0.5) so TEV stage 2's AddSigned recovers the
+    //     user-picked color.
+    //   - ETC1A4: all-zero alpha nibbles decode to alpha 0 — the mesh draws
+    //     fully transparent, i.e. INVISIBLE. Suspected cause of MFA's
+    //     missing arms and missing dress-middle sections (every geometry-
+    //     level probe showed the meshes are positioned correctly but never
+    //     visible). Fixed by substituting opaque alpha + mid-gray color.
+    //
+    // Mid-gray ETC1 block: differential mode, base RGB5(15,15,15) ≈
+    // RGB8(120,120,120) per subblock, no deltas, no modifiers, no flip.
+    // 8-byte representation (little-endian) =
+    //   { 0x00, 0x00, 0x00, 0x00, 0x02, 0x78, 0x78, 0x78 }
+    // ETC1A4 subtile = 16 bytes: 8 alpha bytes (4bpp) FIRST, then the ETC1
+    // color block (see texture_decode.cpp, TextureFormat::ETC1A4 case).
+    boost::container::small_vector<u8, 32 * 1024> mid_gray_buf;
+    std::span<u8> effective_upload = upload_data;
+    if (renderer.Rasterizer()->GetMidGrayEtc1Fallback() && !upload_data.empty()) {
+        bool all_zero = true;
+        for (u8 b : upload_data) {
+            if (b != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            // ≥ 32×32 gate keeps tiny mip thumbnails (16×16) from being
+            // substituted where flat mid-gray would look obviously wrong.
+            const bool size_ok = load_info.width >= 32 && load_info.height >= 32;
+            if (surface.pixel_format == PixelFormat::ETC1 && size_ok) {
+                static constexpr std::array<u8, 8> mid_gray_block = {
+                    0x00, 0x00, 0x00, 0x00, 0x02, 0x78, 0x78, 0x78,
+                };
+                mid_gray_buf.resize(upload_data.size());
+                for (std::size_t i = 0; i + 8 <= mid_gray_buf.size(); i += 8) {
+                    std::memcpy(mid_gray_buf.data() + i, mid_gray_block.data(), 8);
+                }
+                effective_upload = std::span<u8>(mid_gray_buf.data(), mid_gray_buf.size());
+                LOG_DEBUG(HW_GPU,
+                         "MidGrayEtc1Fallback applied addr=0x{:08X} dim={}x{} size=0x{:X}",
+                         surface.addr, load_info.width, load_info.height,
+                         static_cast<u32>(upload_data.size()));
+            } else if (surface.pixel_format == PixelFormat::ETC1A4 && size_ok) {
+                static constexpr std::array<u8, 16> mid_gray_a4_block = {
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0x00, 0x00, 0x00, 0x00, 0x02, 0x78, 0x78, 0x78,
+                };
+                mid_gray_buf.resize(upload_data.size());
+                for (std::size_t i = 0; i + 16 <= mid_gray_buf.size(); i += 16) {
+                    std::memcpy(mid_gray_buf.data() + i, mid_gray_a4_block.data(), 16);
+                }
+                effective_upload = std::span<u8>(mid_gray_buf.data(), mid_gray_buf.size());
+                LOG_DEBUG(HW_GPU,
+                         "MidGrayEtc1A4Fallback applied addr=0x{:08X} dim={}x{} size=0x{:X}",
+                         surface.addr, load_info.width, load_info.height,
+                         static_cast<u32>(upload_data.size()));
+            } else if (surface.pixel_format == PixelFormat::RGBA4 && size_ok) {
+                // All-zero RGBA4 = RGBA(0,0,0,0) = fully transparent mesh.
+                // The MFA zero-upload log showed a single 128x128 RGBA4
+                // all-zero upload at boot — profile of a character skin
+                // atlas. Once cached transparent, it stays transparent
+                // because the later JIT-bypass writes never trigger a
+                // re-upload. Substitute opaque mid-gray texels: R=7 G=7
+                // B=7 A=15 -> u16 0x777F, little-endian bytes {7F, 77}.
+                mid_gray_buf.resize(upload_data.size());
+                for (std::size_t i = 0; i + 2 <= mid_gray_buf.size(); i += 2) {
+                    mid_gray_buf[i] = 0x7F;
+                    mid_gray_buf[i + 1] = 0x77;
+                }
+                effective_upload = std::span<u8>(mid_gray_buf.data(), mid_gray_buf.size());
+                LOG_DEBUG(HW_GPU,
+                         "MidGrayRgba4Fallback applied addr=0x{:08X} dim={}x{} size=0x{:X}",
+                         surface.addr, load_info.width, load_info.height,
+                         static_cast<u32>(upload_data.size()));
+            }
+        }
+    }
+
+    DecodeTexture(load_info, load_info.addr, load_info.end, effective_upload, staging.mapped,
                   runtime.NeedsConversion(surface));
 
     const bool should_dump = False(surface.flags & SurfaceFlagBits::Custom) &&
                              False(surface.flags & SurfaceFlagBits::RenderTarget);
     if (dump_textures && should_dump) {
-        const u64 hash = ComputeHash(load_info, upload_data);
+        const u64 dump_hash = ComputeHash(load_info, upload_data);
         const u32 level = surface.LevelOf(load_info.addr);
-        custom_tex_manager.DumpTexture(load_info, level, upload_data, hash);
+        custom_tex_manager.DumpTexture(load_info, level, upload_data, dump_hash);
     }
 
     const BufferTextureCopy upload = {
@@ -1199,6 +1375,12 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
     SurfaceId reinterpret_id =
         FindMatch<MatchFlags::Reinterpret>(params, ScaleMatch::Ignore, interval);
     if (reinterpret_id) {
+        // IGNORE_FORMAT_REINTERPRETATION (title-gated, Zeusiota/canary):
+        // a differently-formatted GPU surface owns this data; keep our
+        // surface's current contents instead of running the reinterpreters.
+        if (Common::Hacks::g_ignore_format_reinterpretation.load(std::memory_order_relaxed)) {
+            return true;
+        }
         Surface& src_surface = slot_surfaces[reinterpret_id];
         const SurfaceInterval copy_interval = src_surface.GetCopyableInterval(params);
         if (boost::icl::is_empty(copy_interval & interval)) {
@@ -1223,6 +1405,20 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
     }
 
     // No surfaces were found in the cache that had a matching bit-width.
+    // LEGACY_VALIDATION_SKIP (title-gated): the pre-#69 rule, as in Citra 2104 - skip only when
+    // the WHOLE interval is GPU-modified and no invalid-format surface is in it.
+    if (Common::Hacks::g_legacy_validation_skip.load(std::memory_order_relaxed)) {
+        bool has_invalid = false;
+        ForEachSurfaceInRegion(boost::icl::lower(interval), boost::icl::length(interval),
+                               [&](SurfaceId, Surface& region_surface) {
+                                   if (region_surface.pixel_format == PixelFormat::Invalid) {
+                                       has_invalid = true;
+                                       return true;
+                                   }
+                                   return false;
+                               });
+        return !has_invalid && boost::icl::contains(dirty_regions, interval);
+    }
     // Before entering the slow path, check if part of the interval is owned
     // by a gpu modified surface with a different stride than ours. This is indicative
     // of texture aliasing by the guest, which for the vast majority of cases we don't
@@ -1238,6 +1434,7 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
 template <class T>
 void RasterizerCache<T>::ClearAll(bool flush) {
     const auto flush_interval = PageMap::interval_type::right_open(0x0, 0xFFFFFFFF);
+    ++mutation_gen;
     // Force flush all surfaces from the cache
     if (flush) {
         FlushRegion(0x0, 0xFFFFFFFF);
@@ -1279,6 +1476,7 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
         const auto interval = size <= 8 ? region : region & flush_interval;
         Surface& surface = slot_surfaces[surface_id];
         ASSERT_MSG(surface.IsRegionValid(interval), "Region owner has invalid regions");
+        ++mutation_gen;
 
         const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 0.f, 1.f},
                                "RasterizerCache::FlushRegion (from {:#x} to {:#x})",
@@ -1327,10 +1525,22 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         region_owner.MarkValid(invalid_interval);
     }
 
+    // An invalidation that only re-marks its own owner, or re-marks ranges of other surfaces
+    // that are already invalid (the per-draw framebuffer invalidation repeated), does not change
+    // what a later lookup returns. The already-invalid test only runs for DRAW_LOOKUP_REUSE.
+    const bool track_other_changes =
+        Common::Hacks::g_draw_lookup_reuse.load(std::memory_order_relaxed);
+    bool touched_other = !region_owner_id;
     boost::container::small_vector<SurfaceId, 4> remove_surfaces;
     ForEachSurfaceInRegion(addr, size, [&](SurfaceId surface_id, Surface& surface) {
         if (surface_id == region_owner_id) {
             return;
+        }
+        if (!touched_other) {
+            touched_other =
+                !track_other_changes ||
+                !boost::icl::contains(surface.invalid_regions,
+                                      surface.GetInterval() & invalid_interval);
         }
         // If the CPU is invalidating this region we want to remove it
         // to (likely) mark the memory pages as uncached
@@ -1352,6 +1562,9 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
     } else {
         dirty_regions.erase(invalid_interval);
     }
+    if (touched_other) {
+        ++mutation_gen;
+    }
 
     for (const SurfaceId surface_id : remove_surfaces) {
         UnregisterSurface(surface_id);
@@ -1361,6 +1574,7 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
 template <class T>
 SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
                                             const SurfaceFlagBits& initial_flags) {
+    ++mutation_gen;
     const SurfaceId surface_id = [&] {
         const auto it = std::find_if(sentenced.begin(), sentenced.end(), [&](const auto& pair) {
             return slot_surfaces[pair.first] == params;
@@ -1386,6 +1600,7 @@ void RasterizerCache<T>::RegisterSurface(SurfaceId surface_id) {
     ASSERT_MSG(False(surface.flags & SurfaceFlagBits::Registered),
                "Trying to register an already registered surface");
 
+    ++mutation_gen;
     surface.flags |= SurfaceFlagBits::Registered;
     UpdatePagesCachedCount(surface.addr, surface.size, 1);
     ForEachPage(surface.addr, surface.size,
@@ -1398,6 +1613,7 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
     ASSERT_MSG(True(surface.flags & SurfaceFlagBits::Registered),
                "Trying to unregister an already unregistered surface");
 
+    ++mutation_gen;
     surface.flags &= ~SurfaceFlagBits::Registered;
     UpdatePagesCachedCount(surface.addr, surface.size, -1);
     ForEachPage(surface.addr, surface.size, [this, surface_id](u64 page) {

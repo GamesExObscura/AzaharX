@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <span>
 #include <vector>
 #include <boost/serialization/base_object.hpp>
@@ -196,6 +197,16 @@ void GSP_GPU::WriteHWRegs(Kernel::HLERequestContext& ctx) {
     const u32 size = rp.Pop<u32>();
     const auto src_data = rp.PopStaticBuffer();
 
+    // [HWREG-DIAG] gated: catch stalled games that set their display
+    // framebuffers via direct register writes instead of the shared-mem
+    // fbinfo path (PDC0 regs ~0x400400-0x400500, PDC1 ~0x400500-0x400600).
+    if (Common::Hacks::g_vblank_signal_before_present.load(std::memory_order_relaxed)) {
+        const u32 first_word =
+            src_data.size() >= 4 ? *reinterpret_cast<const u32*>(src_data.data()) : 0;
+        LOG_INFO(Service_GSP, "[HWREG-DIAG] write addr=0x{:08X} size=0x{:X} w0=0x{:08X}", reg_addr,
+                 size, first_word);
+    }
+
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(GSP::WriteHWRegs(reg_addr, size, src_data, system.GPU()));
 }
@@ -250,6 +261,9 @@ void GSP_GPU::SetBufferSwap(Kernel::HLERequestContext& ctx) {
     u32 screen_id = rp.Pop<u32>();
     auto fb_info = rp.PopRaw<FrameBufferInfo>();
 
+    LOG_DEBUG(Service_GSP, "called, screen={} addrL=0x{:08X} addrR=0x{:08X}", screen_id,
+              static_cast<u32>(fb_info.address_left), static_cast<u32>(fb_info.address_right));
+
     system.GPU().SetBufferSwap(screen_id, fb_info);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
@@ -284,6 +298,43 @@ void GSP_GPU::InvalidateDataCache(Kernel::HLERequestContext& ctx) {
 
     LOG_TRACE(Service_GSP, "(STUBBED) called address=0x{:08X}, size=0x{:08X}, process={}", address,
               size, process->process_id);
+}
+
+void GSP_GPU::RequestDma(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const u32 src_addr = rp.Pop<u32>();
+    const u32 dst_addr = rp.Pop<u32>();
+    const u32 size = rp.Pop<u32>();
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+
+    const auto src_ptr = system.Memory().GetPointer(src_addr);
+    auto dst_ptr = system.Memory().GetPointer(dst_addr);
+
+    if (!src_ptr || !dst_ptr) {
+        LOG_ERROR(Service_GSP,
+                  "RequestDma IPC: failed to resolve src=0x{:08X} dst=0x{:08X}",
+                  src_addr, dst_addr);
+        rb.Push(ResultSuccess);
+        return;
+    }
+
+    system.Memory().RasterizerFlushVirtualRegion(src_addr, size, Memory::FlushMode::Flush);
+    std::memcpy(dst_ptr, src_ptr, size);
+    system.Memory().RasterizerFlushVirtualRegion(dst_addr, size, Memory::FlushMode::Invalidate);
+
+    // Release fence: pairs with the acquire fence in gl_rasterizer's vertex
+    // array setup. Ensures the memcpy + InvalidateRegion above are visible to
+    // the render thread before this IPC handler returns success.
+    std::atomic_thread_fence(std::memory_order_release);
+
+    // Hardware raises the GSP DMA interrupt when the transfer completes,
+    // and classic Citra's RequestDma always signaled it. Games that wait
+    // on the interrupt after a successful RequestDma hang forever without
+    // this (Art Academy locks up entering a lesson).
+    SignalInterrupt(InterruptId::DMA, 0);
+
+    rb.Push(ResultSuccess);
 }
 
 void GSP_GPU::SetAxiConfigQoSMode(Kernel::HLERequestContext& ctx) {
@@ -425,7 +476,10 @@ void GSP_GPU::SignalInterruptForThread(InterruptId interrupt_id, u32 thread_id, 
         perf_recorder.UpdateTime(interrupt_id, wait_delay_ns);
     }
 
-    if (Settings::values.simulate_3ds_gpu_timings.GetValue()) {
+    // DISABLE_GPU_TIMING_SIM (title-gated): behave like Citra 2104, which
+    // signals GPU completion interrupts with no delay at all.
+    if (Settings::values.simulate_3ds_gpu_timings.GetValue() &&
+        !Common::Hacks::g_disable_gpu_timing_sim.load(std::memory_order_relaxed)) {
 
         if (delay_texture_copy_completion) {
             wait_delay_ns += (interrupt_id == InterruptId::PPF)
@@ -499,12 +553,31 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
 
             interrupt_relay_queue->slot[next] = interrupt_id;
 
+            // GSP_LEGACY_PDC_QUEUE (title-gated): Citra 2104 writes
+            // error_code = 0 on EVERY successful queue (gsp_gpu.cpp:355).
+            // Azahar only ever writes it on overflow, so the field the guest
+            // polls in shared memory is never cleared here. No service call
+            // touches it, which is why no IPC trace could show this.
+            if (Common::Hacks::g_gsp_legacy_pdc_queue.load(std::memory_order_relaxed)) {
+                interrupt_relay_queue->error_code = 0;
+            }
+
             interrupt_event->Signal();
         }
     };
 
     if (is_pdc) {
-        if (!interrupt_relay_queue->ignore_pdc.Value()) {
+        // GSP_LEGACY_PDC_QUEUE (title-gated): Citra 2104 queues and signals
+        // every PDC unconditionally. Azahar honours ignore_pdc and stops
+        // queuing past stop_queuing_pdc_threeshold, and in both of those
+        // paths interrupt_event->Signal() never runs — so a title that
+        // blocks on that event before programming its render targets never
+        // wakes. queue_interrupt() keeps the max_slots bound, so this
+        // restores the delivery behaviour without removing the overflow
+        // guard.
+        if (Common::Hacks::g_gsp_legacy_pdc_queue.load(std::memory_order_relaxed)) {
+            queue_interrupt();
+        } else if (!interrupt_relay_queue->ignore_pdc.Value()) {
 
             if (interrupt_relay_queue->number_interrupts >=
                 InterruptRelayQueue::stop_queuing_pdc_threeshold) {
@@ -522,6 +595,15 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
         const s32 screen_id = (interrupt_id == InterruptId::PDC0) ? 0 : 1;
 
         auto* info = GetFrameBufferInfo(thread_id, screen_id);
+        // [FBSWAP-DIAG] gated: does the stalled game ever mark its shared-mem
+        // framebuffer info dirty, and with what address?
+        if (Common::Hacks::g_vblank_signal_before_present.load(std::memory_order_relaxed) &&
+            interrupt_id == InterruptId::PDC0) {
+            LOG_INFO(Service_GSP,
+                     "[FBSWAP-DIAG] pdc0 thread={} dirty={} index={} addrL=0x{:08X}", thread_id,
+                     static_cast<u32>(info->is_dirty), static_cast<u32>(info->index),
+                     static_cast<u32>(info->framebuffer_info[info->index].address_left));
+        }
         if (info->is_dirty) {
             system.GPU().SetBufferSwap(screen_id, info->framebuffer_info[info->index]);
             info->is_dirty.Assign(false);
@@ -571,10 +653,33 @@ void GSP_GPU::SetLcdForceBlack(Kernel::HLERequestContext& ctx) {
 void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
+    // GSP_DRAIN_QUEUE_ON_ACQUIRE (title-gated): with no thread holding the GPU right there is no
+    // command buffer to run; leave the caller's queue pending until it acquires the right.
+    if (Common::Hacks::g_gsp_drain_queue_on_acquire.load(std::memory_order_relaxed) &&
+        active_thread_id == std::numeric_limits<u32>::max()) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultSuccess);
+        return;
+    }
+
     auto* command_buffer = GetCommandBuffer(active_thread_id);
     auto& gpu = system.GPU();
 
+    // ([TRIGGER-DIAG] removed 2026-07-25. It piggybacked on the
+    // VBLANK_SIGNAL_BEFORE_PRESENT flag and emitted ~9,800 lines per session
+    // for the gated titles. It also silently invalidated an Azahar-vs-Citra
+    // GSP call-count comparison, since Citra's TriggerCmdReqQueue logs
+    // nothing at all. The functional hack itself is untouched.)
+
     bool requires_delay = false;
+
+    // AUTO_RENDER_THREAD_DELAY (title-gated): when the user has not set a render-thread delay,
+    // gated titles get their known-good value automatically. Ungated titles see only the setting.
+    u32 render_delay_us = Settings::values.delay_game_render_thread_us.GetValue();
+    if (render_delay_us == 0) {
+        render_delay_us =
+            Common::Hacks::g_auto_render_thread_delay_us.load(std::memory_order_relaxed);
+    }
 
     while (command_buffer->number_commands) {
         if (command_buffer->should_stop) {
@@ -586,8 +691,7 @@ void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
         }
 
         Command command = command_buffer->commands[command_buffer->index];
-        if (command.id == CommandId::SubmitCmdList && !requires_delay &&
-            Settings::values.delay_game_render_thread_us.GetValue() != 0) {
+        if (command.id == CommandId::SubmitCmdList && !requires_delay && render_delay_us != 0) {
             requires_delay = true;
         }
 
@@ -607,10 +711,11 @@ void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
         }
     }
 
+
     if (requires_delay) {
         ctx.RunAsync(
-            [](Kernel::HLERequestContext& ctx) {
-                return Settings::values.delay_game_render_thread_us.GetValue() * 1000;
+            [render_delay_us](Kernel::HLERequestContext& ctx) {
+                return static_cast<s64>(render_delay_us) * 1000;
             },
             [](Kernel::HLERequestContext& ctx) {
                 IPC::RequestBuilder rb(ctx, 1, 0);
@@ -882,11 +987,49 @@ Result GSP_GPU::AcquireGpuRight(const Kernel::HLERequestContext& ctx,
     return ResultSuccess;
 }
 
+void GSP_GPU::DrainCommandQueueOnAcquire(u32 thread_id) {
+    auto* command_buffer = GetCommandBuffer(thread_id);
+    if (command_buffer->number_commands == 0) {
+        return;
+    }
+    LOG_INFO(Service_GSP, "[GXQ-DRAIN] running {} pending GX command(s) for thread {}",
+             static_cast<u32>(command_buffer->number_commands), thread_id);
+
+    auto& gpu = system.GPU();
+    while (command_buffer->number_commands) {
+        if (command_buffer->should_stop) {
+            command_buffer->status.Assign(CommandBuffer::STATUS_STOPPED);
+            break;
+        }
+        if (command_buffer->status == CommandBuffer::STATUS_STOPPED) {
+            break;
+        }
+
+        Command command = command_buffer->commands[command_buffer->index];
+        command_buffer->number_commands.Assign(command_buffer->number_commands - 1);
+        command_buffer->index.Assign((command_buffer->index + 1) % 0xF);
+
+        gpu.Debugger().GXCommandProcessed(command);
+
+        system.perf_stats->BeginGPUProcessing();
+        gpu.Execute(command);
+        system.perf_stats->EndGPUProcessing();
+
+        if (command.stop) {
+            command_buffer->status.Assign(CommandBuffer::STATUS_STOPPED);
+        }
+    }
+}
+
 void GSP_GPU::TryAcquireRight(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
     const auto process = rp.PopObject<Kernel::Process>();
 
     const auto result = AcquireGpuRight(ctx, process, 0, false);
+    if (result == ResultSuccess &&
+        Common::Hacks::g_gsp_drain_queue_on_acquire.load(std::memory_order_relaxed)) {
+        DrainCommandQueueOnAcquire(active_thread_id);
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(result);
@@ -898,6 +1041,10 @@ void GSP_GPU::AcquireRight(Kernel::HLERequestContext& ctx) {
     const auto process = rp.PopObject<Kernel::Process>();
 
     const auto result = AcquireGpuRight(ctx, process, flag, true);
+    if (result == ResultSuccess &&
+        Common::Hacks::g_gsp_drain_queue_on_acquire.load(std::memory_order_relaxed)) {
+        DrainCommandQueueOnAcquire(active_thread_id);
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(result);
@@ -996,7 +1143,7 @@ GSP_GPU::GSP_GPU(Core::System& system) : ServiceFramework("gsp::Gpu", 4), system
         {0x0004, &GSP_GPU::ReadHWRegs, "ReadHWRegs"},
         {0x0005, &GSP_GPU::SetBufferSwap, "SetBufferSwap"},
         {0x0006, nullptr, "SetCommandList"},
-        {0x0007, nullptr, "RequestDma"},
+        {0x0007, &GSP_GPU::RequestDma, "RequestDma"},
         {0x0008, &GSP_GPU::FlushDataCache, "FlushDataCache"},
         {0x0009, &GSP_GPU::InvalidateDataCache, "InvalidateDataCache"},
         {0x000A, nullptr, "RegisterInterruptEvents"},

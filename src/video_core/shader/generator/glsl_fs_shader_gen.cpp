@@ -2,9 +2,18 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
+
+#include "common/hacks/hack_manager.h"
 #include "video_core/shader/generator/glsl_fs_shader_gen.h"
 
 namespace Pica::Shader::Generator::GLSL {
+
+// PMG3D fix flag — when set, generated FS samples tex0 at base mip
+// (textureLod = 0) instead of the standard computed-LOD path that returns
+// black for textures whose higher mip levels weren't populated.
+// Defined in glsl_shader_gen.cpp; toggled via EnablePmg3dForceLod0.
+extern std::atomic<bool> g_pmg3d_force_lod0;
 
 using ProcTexClamp = TexturingRegs::ProcTexClamp;
 using ProcTexShift = TexturingRegs::ProcTexShift;
@@ -297,10 +306,28 @@ void FragmentModule::AppendColorModifier(
         out += fmt::format("vec3(1.0) - {}.ggg", color_source);
         break;
     case ColorModifier::SourceBlue:
-        out += fmt::format("{}.bbb", color_source);
+        // FROGGER_SPECULAR_BLUE (title-gated): substitute ONLY where a stage
+        // reads secondary_fragment_color's BLUE channel as a blend factor —
+        // Frogger's frog material does exactly that
+        // (out = tex * spec.b + (1 - spec.b)) and spec.b arrives as 0, so the
+        // model renders pure white. Every OTHER material in the title reads
+        // secondary_fragment_color.rgb as a real specular colour; overriding
+        // the shared value tinted all of them blue, so the substitution is
+        // scoped to this modifier + source pair only.
+        if (Common::Hacks::g_frogger_specular_blue.load(std::memory_order_relaxed) &&
+            color_source == "secondary_fragment_color") {
+            out += "vec3(1.0)";
+        } else {
+            out += fmt::format("{}.bbb", color_source);
+        }
         break;
     case ColorModifier::OneMinusSourceBlue:
-        out += fmt::format("vec3(1.0) - {}.bbb", color_source);
+        if (Common::Hacks::g_frogger_specular_blue.load(std::memory_order_relaxed) &&
+            color_source == "secondary_fragment_color") {
+            out += "vec3(0.0)";
+        } else {
+            out += fmt::format("vec3(1.0) - {}.bbb", color_source);
+        }
         break;
     default:
         out += "vec3(0.0)";
@@ -810,6 +837,15 @@ void FragmentModule::WriteLighting() {
     out += "diffuse_sum.rgb += lighting_global_ambient;\n"
            "primary_fragment_color = clamp(diffuse_sum, vec4(0.0), vec4(1.0));\n"
            "secondary_fragment_color = clamp(specular_sum, vec4(0.0), vec4(1.0));\n";
+
+
+    // (The blanket "secondary_fragment_color.b = 1.0" override that used to sit
+    // here was REMOVED 2026-07-25. It fixed the frog but tinted the whole game
+    // blue: Frogger's frog material is the ONLY one reading spec.bbb as a blend
+    // factor — all 18 other materials read spec.rgb as a real specular colour,
+    // and forcing b=1 while r,g stayed ~0 handed them pure blue. The
+    // substitution now lives in AppendColorModifier, scoped to the
+    // SourceBlue/OneMinusSourceBlue + secondary_fragment_color pair only.)
 }
 
 void FragmentModule::WriteFog() {
@@ -1453,10 +1489,15 @@ uint UpdateShadow(uint pixel, uint d, uint s) {
 
     if (config.texture.texture0_type == TexturingRegs::TextureConfig::Shadow2D ||
         config.texture.texture0_type == TexturingRegs::TextureConfig::ShadowCube) {
+        // SHADOW_EQUAL_DEPTH_LIT (title-gated): a depth tie is lit, as in the software renderer.
+        const bool shadow_tie_lit =
+            Common::Hacks::g_shadow_equal_depth_lit.load(std::memory_order_relaxed);
         out += R"(
 float CompareShadow(uint pixel, uint z) {
     uvec2 p = DecodeShadow(pixel);
-    return mix(float(p.y) * (1.0 / 255.0), 0.0, p.x <= z);
+    return mix(float(p.y) * (1.0 / 255.0), 0.0, )";
+        out += shadow_tie_lit ? "p.x < z" : "p.x <= z";
+        out += R"();
 }
 
 float mix2(vec4 s, vec2 a) {
@@ -1709,8 +1750,16 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
     case 0:
         switch (config.texture.texture0_type) {
         case TexturingRegs::TextureConfig::Texture2D:
-            out += "return textureLod(tex0, texcoord0, getLod(texcoord0 * "
-                   "vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);";
+            if (g_pmg3d_force_lod0.load(std::memory_order_relaxed)) {
+                // PMG3D: force LOD 0 so we read the base (populated) mip.
+                // PMG3D's ETC1 intro logos never have their higher mip
+                // levels uploaded, so the standard computed-LOD path
+                // samples empty data and returns (0,0,0,0).
+                out += "return textureLod(tex0, texcoord0, 0.0);";
+            } else {
+                out += "return textureLod(tex0, texcoord0, getLod(texcoord0 * "
+                       "vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);";
+            }
             break;
         case TexturingRegs::TextureConfig::Projection2D:
             // TODO (wwylele): find the exact LOD formula for projection texture

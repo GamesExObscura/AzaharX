@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "common/hacks/hack_list.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/custom_textures/material.h"
@@ -200,6 +201,10 @@ bool TextureRuntime::ClearTextureWithoutFbo(Surface& surface,
         clear.value.color.r(), clear.value.color.g(), clear.value.color.b(), clear.value.color.a());
 
     if (!driver.HasArbClearTexture() || driver.HasBug(DriverBug::BrokenClearTexture)) {
+        return false;
+    }
+    // FORCE_FBO_CLEAR (title-gated): use the framebuffer clear path like BrokenClearTexture.
+    if (Common::Hacks::g_force_fbo_clear.load(std::memory_order_relaxed)) {
         return false;
     }
     GLenum format{};
@@ -687,6 +692,22 @@ Framebuffer::Framebuffer(TextureRuntime& runtime, const VideoCore::FramebufferPa
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D,
                                    0, 0);
         }
+    }
+
+    // [FB-DIAG] LEGO Harry Potter 5-7 / LEGO SW Clone Wars III die with
+    // GL_INVALID_FRAMEBUFFER_OPERATION at draw time (black screen). Log the
+    // exact attachment configuration whenever a framebuffer is built
+    // incomplete so the offending combination can be identified. Constructor
+    // runs only on cache miss, so this is cheap.
+    const GLenum fb_status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    if (fb_status != GL_FRAMEBUFFER_COMPLETE) {
+        LOG_CRITICAL(Render_OpenGL,
+                     "[FB-DIAG] INCOMPLETE fbo={} status=0x{:X}: shadow={} | color={} fmt={} "
+                     "{}x{} level={} | depth={} fmt={} level={}",
+                     framebuffer.handle, fb_status, shadow_rendering, color != nullptr,
+                     color ? static_cast<int>(color->pixel_format) : -1, color ? color->width : 0,
+                     color ? color->height : 0, color_level, depth != nullptr,
+                     depth ? static_cast<int>(depth->pixel_format) : -1, depth_level);
     }
 }
 

@@ -9,6 +9,8 @@
 #include <cryptopp/modes.h>
 #include <cryptopp/sha.h>
 #include "common/common_types.h"
+#include "common/file_util.h"
+#include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
 #include "common/zstd_compression.h"
 #include "core/core.h"
@@ -507,6 +509,30 @@ Loader::ResultStatus NCCHContainer::LoadSectionExeFS(const char* name, std::vect
                 buffer.resize(section_size);
                 if (exefs_file->ReadBytes(buffer.data(), section_size) != section_size)
                     return Loader::ResultStatus::Error;
+            }
+
+            // DUMP_CODE_BIN (title-gated, diagnostic): write the fully
+            // decompressed .code section to dump/code/<TID>_code.bin for
+            // static analysis. Dumping here rather than with an external
+            // tool means the LZSS decompression above has already been
+            // applied, which is what a disassembler wants.
+            if (strcmp(section.name, ".code") == 0) {
+                const u64 tid = static_cast<u64>(ncch_header.program_id);
+                const auto* dump_hack = Common::Hacks::hack_manager.GetHack(
+                    Common::Hacks::HackType::DUMP_CODE_BIN, tid);
+                if (dump_hack && dump_hack->mode == Common::Hacks::HackAllowMode::FORCE) {
+                    const std::string dir =
+                        fmt::format("{}code/", FileUtil::GetUserPath(FileUtil::UserPath::DumpDir));
+                    FileUtil::CreateFullPath(dir);
+                    const std::string path = fmt::format("{}{:016X}_code.bin", dir, tid);
+                    FileUtil::IOFile out(path, "wb");
+                    if (out.IsOpen() && out.WriteBytes(buffer.data(), buffer.size())) {
+                        LOG_INFO(Service_FS, "[DUMP-CODE] wrote {} ({:#x} bytes, compressed={})",
+                                 path, buffer.size(), is_compressed);
+                    } else {
+                        LOG_ERROR(Service_FS, "[DUMP-CODE] failed to write {}", path);
+                    }
+                }
             }
 
             return Loader::ResultStatus::Success;

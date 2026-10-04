@@ -10,6 +10,7 @@
 #include "common/file_util.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "common/hacks/hack_list.h"
 #include "core/file_sys/disk_archive.h"
 #include "core/file_sys/errors.h"
 
@@ -36,6 +37,15 @@ ResultVal<std::size_t> DiskFile::Write(const u64 offset, const std::size_t lengt
     std::size_t written = file->WriteBytes(buffer, length);
     if (flush)
         file->Flush();
+
+    // FS_SAVE_DIAG: report every guest write that reaches the host file,
+    // including short writes (written < length), which the return value
+    // alone hides from the guest.
+    if (Common::Hacks::g_fs_save_diag.load(std::memory_order_relaxed)) {
+        LOG_INFO(Service_FS,
+                 "[FS-SAVE] write offset={:#x} len={:#x} written={:#x} flush={} size_after={:#x}",
+                 offset, length, written, flush, file->GetSize());
+    }
     return written;
 }
 
@@ -46,10 +56,16 @@ u64 DiskFile::GetSize() const {
 bool DiskFile::SetSize(const u64 size) const {
     file->Resize(size);
     file->Flush();
+    if (Common::Hacks::g_fs_save_diag.load(std::memory_order_relaxed)) {
+        LOG_INFO(Service_FS, "[FS-SAVE] setsize {:#x} -> actual {:#x}", size, file->GetSize());
+    }
     return true;
 }
 
 bool DiskFile::Close() {
+    if (Common::Hacks::g_fs_save_diag.load(std::memory_order_relaxed)) {
+        LOG_INFO(Service_FS, "[FS-SAVE] close, final size {:#x}", file->GetSize());
+    }
     return file->Close();
 }
 

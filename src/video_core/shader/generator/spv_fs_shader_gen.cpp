@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <boost/container/small_vector.hpp>
+#include "common/hacks/hack_list.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 #include "video_core/shader/generator/spv_fs_shader_gen.h"
 
@@ -757,7 +758,10 @@ Id FragmentModule::CompareShadow(Id pixel, Id z) {
     const Id pixel_d24{OpShiftRightLogical(u32_id, pixel, ConstS32(8))};
     const Id pixel_s8{OpConvertUToF(f32_id, OpBitwiseAnd(u32_id, pixel, ConstU32(255u)))};
     const Id s8_f32{OpFMul(f32_id, pixel_s8, ConstF32(1.f / 255.f))};
-    const Id d24_leq_z{OpULessThanEqual(bool_id, pixel_d24, z)};
+    // SHADOW_EQUAL_DEPTH_LIT (title-gated): a depth tie is lit, as in the software renderer.
+    const Id d24_leq_z{Common::Hacks::g_shadow_equal_depth_lit.load(std::memory_order_relaxed)
+                           ? OpULessThan(bool_id, pixel_d24, z)
+                           : OpULessThanEqual(bool_id, pixel_d24, z)};
     return OpSelect(f32_id, d24_leq_z, ConstF32(0.f), s8_f32);
 }
 

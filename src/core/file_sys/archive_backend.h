@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -12,6 +13,7 @@
 #include <boost/serialization/vector.hpp>
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "common/hacks/hack_list.h"
 #include "common/swap.h"
 #include "core/file_sys/delay_generator.h"
 #include "core/hle/result.h"
@@ -211,6 +213,39 @@ public:
                     "(STUBBED) called, archive={}, action={:08X}, input_size={:08X}, "
                     "output_size={:08X}",
                     GetName(), action, input_size, output_size);
+        // FS_CONTROL_ZERO_OUTPUT / FS_CONTROL_ONE_OUTPUT (title-gated): the
+        // stub returns success but never writes output[], so games reading
+        // the output byte get whatever garbage the buffer held and can
+        // loop/hang on it. Fill with a deterministic value: 1 for the Torus
+        // engine (reads it as a commit/ready flag), 0 otherwise (RCT-style
+        // "save enabled?" checks). ONE takes precedence if both gated.
+        // FS_SAVE_DIAG: dump what the guest actually asked for. The one-fill
+        // above is applied to EVERY action indiscriminately, so if a title
+        // uses more than action 0 here (e.g. an 8-byte timestamp read) it is
+        // being handed 0x0101... and this line is where that shows up.
+        if (Common::Hacks::g_fs_save_diag.load(std::memory_order_relaxed)) {
+            std::string in_hex;
+            if (input != nullptr) {
+                for (size_t i = 0; i < input_size && i < 32; ++i) {
+                    in_hex += fmt::format("{:02X} ", input[i]);
+                }
+            }
+            LOG_INFO(Service_FS, "[FS-SAVE] Control archive={} action={:#x} in[{}]={} out_size={}",
+                     GetName(), action, input_size, in_hex, output_size);
+        }
+        if (output != nullptr && output_size > 0) {
+            if (Common::Hacks::g_fs_control_one_output.load(std::memory_order_relaxed)) {
+                std::memset(output, 1, output_size);
+                LOG_INFO(Service_FS,
+                         "[FS-CONTROL-ONE] one-filled Control output ({} bytes, action={:08X})",
+                         output_size, action);
+            } else if (Common::Hacks::g_fs_control_zero_output.load(std::memory_order_relaxed)) {
+                std::memset(output, 0, output_size);
+                LOG_INFO(Service_FS,
+                         "[FS-CONTROL-ZERO] zero-filled Control output ({} bytes, action={:08X})",
+                         output_size, action);
+            }
+        }
         return ResultSuccess;
     }
 

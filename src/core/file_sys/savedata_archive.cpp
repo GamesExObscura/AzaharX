@@ -4,6 +4,7 @@
 
 #include "common/archives.h"
 #include "common/file_util.h"
+#include "common/hacks/hack_list.h"
 #include "core/file_sys/disk_archive.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/path_parser.h"
@@ -350,6 +351,23 @@ ResultVal<std::unique_ptr<DirectoryBackend>> SaveDataArchive::OpenDirectory(cons
 }
 
 u64 SaveDataArchive::GetFreeBytes() const {
+    // SAVEDATA_FREE_BYTES_FROM_FORMAT (title-gated): report the size the game itself formatted
+    // (FormatSaveData total_size, kept in "<mount_point>.metadata"), as a real card save would,
+    // instead of the 32 MiB stub. See HackType::SAVEDATA_FREE_BYTES_FROM_FORMAT.
+    if (Common::Hacks::g_savedata_free_bytes_from_format.load(std::memory_order_relaxed)) {
+        std::string metadata_path = mount_point;
+        while (!metadata_path.empty() &&
+               (metadata_path.back() == '/' || metadata_path.back() == '\\')) {
+            metadata_path.pop_back();
+        }
+        metadata_path += ".metadata";
+        FileUtil::IOFile file(metadata_path, "rb");
+        u32 total_size = 0;
+        if (file.IsOpen() && file.ReadBytes(&total_size, sizeof(total_size)) == sizeof(total_size) &&
+            total_size != 0) {
+            return total_size;
+        }
+    }
     // TODO: Stubbed to return 32MiB
     return 1024 * 1024 * 32;
 }

@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/assert.h"
+#include "common/hacks/hack_list.h"
 #include "common/logging/log.h"
 #include "common/memory_detect.h"
 #include "common/microprofile.h"
@@ -46,6 +47,10 @@ struct ScreenRectVertex {
 };
 
 constexpr u32 VERTEX_BUFFER_SIZE = sizeof(ScreenRectVertex) * 8192;
+// Top screen is 400x240 @ 4bpp = 384 KB, bottom is 320x240 @ 4bpp =
+// 307 KB. Both can trigger the fallback per frame; 4 MB is plenty of
+// headroom.
+constexpr u32 FB_UPLOAD_BUFFER_SIZE = 4 * 1024 * 1024;
 
 constexpr std::array<f32, 4 * 4> MakeOrthographicMatrix(u32 width, u32 height) {
     // clang-format off
@@ -115,6 +120,8 @@ RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
       main_present_window{window, instance, scheduler, IsLowRefreshRate()},
       vertex_buffer{instance, scheduler, vk::BufferUsageFlagBits::eVertexBuffer,
                     VERTEX_BUFFER_SIZE},
+      fb_upload_buffer{instance, scheduler, vk::BufferUsageFlagBits::eTransferSrc,
+                       FB_UPLOAD_BUFFER_SIZE},
       update_queue{instance}, rasterizer{memory,
                                          pica,
                                          system.CustomTexManager(),
@@ -237,6 +244,7 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
 void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
                                     bool flipped) {
     if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
+        Common::Hacks::g_force_present_every_frame.load(std::memory_order_relaxed) ||
         Core::PerfStats::game_frames_updated) {
         Frame* frame = window.GetRenderFrame();
 
@@ -273,6 +281,15 @@ void RendererVulkan::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
             ? (right_eye ? framebuffer.address_right1 : framebuffer.address_left1)
             : (right_eye ? framebuffer.address_right2 : framebuffer.address_left2);
 
+    // Title-gated (KEEP_LAST_FRAME_ON_ZERO_FB): the game zeroed this
+    // screen's framebuffer address (Skylanders Giants / Swap Force do it
+    // to the bottom screen during videos). Keep the previous image
+    // instead of presenting from address 0, which shows black.
+    if (framebuffer_addr == 0 &&
+        Common::Hacks::g_keep_last_frame_on_zero_fb.load(std::memory_order_relaxed)) {
+        return;
+    }
+
     LOG_TRACE(Render_Vulkan, "0x{:08x} bytes from 0x{:08x}({}x{}), fmt {:x}",
               framebuffer.stride * framebuffer.height, framebuffer_addr, framebuffer.width.Value(),
               framebuffer.height.Value(), framebuffer.format);
@@ -283,13 +300,130 @@ void RendererVulkan::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
     ASSERT(pixel_stride * bpp == framebuffer.stride);
     ASSERT(pixel_stride % 4 == 0);
 
-    if (!rasterizer.AccelerateDisplay(framebuffer, framebuffer_addr, static_cast<u32>(pixel_stride),
-                                      screen_info)) {
-        // Reset the screen info's display texture to its own permanent texture
+    const bool accelerated = rasterizer.AccelerateDisplay(
+        framebuffer, framebuffer_addr, static_cast<u32>(pixel_stride), screen_info);
+    if (!accelerated) {
+        // Fallback: upload the raw framebuffer bytes from 3DS memory
+        // into the permanent screen texture. Mirrors the OpenGL
+        // renderer's LoadFBToScreenInfo fallback path. Without this,
+        // MFA's loading screen (and any other scene-transition
+        // moment where AccelerateDisplay legitimately can't find a
+        // matching rasterizer surface) would just re-present whatever
+        // was last written to the texture — the visible symptom being
+        // "loading screen stuck on top screen while storybook /
+        // character-custom / gameplay render corrupted underneath."
         screen_info.image_view = screen_info.texture.image_view;
-        screen_info.texcoords = {0.f, 0.f, 1.f, 1.f};
+        // Present shader maps screen X to V. In OpenGL, texture V=0
+        // corresponds to the END of uploaded memory (Y origin is
+        // bottom); in Vulkan it corresponds to the START (Y origin is
+        // top). The accelerated path avoids this because res_cache
+        // uploads its surface via a shader that already accounts for
+        // the axis convention. Our raw copyBufferToImage does not, so
+        // sampling {0,0,1,1} on Vulkan produces a horizontally-mirrored
+        // image vs OpenGL. Swap left/right to invert V axis for the
+        // fallback path only; top/bottom stay at 0/1 because
+        // bufferRowLength = pixel_stride already lays out rows in the
+        // orientation the present shader's U axis expects.
+        screen_info.texcoords = {1.f, 0.f, 0.f, 1.f};
 
-        ASSERT(false);
+        const u32 fb_size = framebuffer.stride * framebuffer.height;
+        if (fb_size == 0 || fb_size > FB_UPLOAD_BUFFER_SIZE) {
+            static u64 s_skip_count = 0;
+            if (s_skip_count < 10) {
+                LOG_DEBUG(Render_Vulkan,
+                         "[VK-FALLBACK-SKIP #{}] size={} exceeds staging {} at 0x{:08X}",
+                         s_skip_count++, fb_size, FB_UPLOAD_BUFFER_SIZE, framebuffer_addr);
+            }
+        } else {
+            rasterizer.FlushRegion(framebuffer_addr, fb_size);
+            const u8* framebuffer_data = memory.GetPhysicalPointer(framebuffer_addr);
+            if (framebuffer_data) {
+                const auto [staging_ptr, staging_offset, invalidate] =
+                    fb_upload_buffer.Map(fb_size, 4);
+                std::memcpy(staging_ptr, framebuffer_data, fb_size);
+                fb_upload_buffer.Commit(fb_size);
+
+                const vk::Image dst_image = screen_info.texture.image;
+                const u32 width = framebuffer.width;
+                const u32 height = framebuffer.height;
+                const u32 row_length = static_cast<u32>(pixel_stride);
+                const vk::Buffer buffer = fb_upload_buffer.Handle();
+
+                renderpass_cache.EndRendering();
+                scheduler.Record([buffer, dst_image, width, height, row_length,
+                                  staging_offset](vk::CommandBuffer cmdbuf) {
+                    const vk::ImageSubresourceRange range = {
+                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    };
+                    const vk::ImageMemoryBarrier pre_barrier = {
+                        // eUndefined discards prior content (fine — we
+                        // overwrite everything). Works whether the
+                        // texture was never touched OR was in eShaderReadOnly
+                        // from a previous fallback frame.
+                        .srcAccessMask = {},
+                        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                        .oldLayout = vk::ImageLayout::eUndefined,
+                        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image = dst_image,
+                        .subresourceRange = range,
+                    };
+                    // eGeneral matches what res_cache surfaces use so
+                    // the descriptor sampler binding sees a consistent
+                    // layout regardless of which code path populated
+                    // screen_info's image_view this frame.
+                    const vk::ImageMemoryBarrier post_barrier = {
+                        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+                        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                        .newLayout = vk::ImageLayout::eGeneral,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image = dst_image,
+                        .subresourceRange = range,
+                    };
+                    // bufferRowLength = pixel_stride mirrors OpenGL's
+                    // glPixelStorei(GL_UNPACK_ROW_LENGTH, pixel_stride).
+                    // Without it Vulkan derives row stride from
+                    // imageExtent.width which is only correct when the
+                    // memory stride equals the image width — MFA and
+                    // several other titles pack framebuffers with
+                    // extra pitch that would otherwise offset every
+                    // row and produce the "chopped up / corrupted"
+                    // sample pattern.
+                    const vk::BufferImageCopy copy = {
+                        .bufferOffset = staging_offset,
+                        .bufferRowLength = row_length,
+                        .bufferImageHeight = 0,
+                        .imageSubresource{
+                            .aspectMask = vk::ImageAspectFlagBits::eColor,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1,
+                        },
+                        .imageOffset = {0, 0, 0},
+                        .imageExtent = {width, height, 1},
+                    };
+                    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+                                           vk::PipelineStageFlagBits::eTransfer,
+                                           vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
+                    cmdbuf.copyBufferToImage(buffer, dst_image,
+                                             vk::ImageLayout::eTransferDstOptimal, copy);
+                    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                           vk::PipelineStageFlagBits::eFragmentShader,
+                                           vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+                });
+            } else {
+                LOG_DEBUG(Render_Vulkan,
+                         "[VK-FALLBACK-NOPTR] no physical pointer for 0x{:08X}",
+                         framebuffer_addr);
+            }
+        }
     }
 }
 
@@ -622,7 +756,13 @@ void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
-        .usage = vk::ImageUsageFlagBits::eSampled,
+        // eTransferDst added so LoadFBToScreenInfo can upload raw
+        // framebuffer bytes into this image when AccelerateDisplay
+        // legitimately fails (scene transitions, early frames). Without
+        // it, the fallback would just re-present whatever was in the
+        // texture last, which is why MFA's loading screen sticks and
+        // storybook renders corrupted on Vulkan.
+        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
     };
 
     const VmaAllocationCreateInfo alloc_info = {
@@ -662,6 +802,38 @@ void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
     texture.width = framebuffer.width;
     texture.height = framebuffer.height;
     texture.format = framebuffer.color_format;
+
+    // Transition the freshly-created image from UNDEFINED to eGeneral
+    // once so it can be sampled from safely regardless of which code
+    // path populates it later (accelerated or fallback). Without this,
+    // Vulkan validation reports "expects layout GENERAL, current is
+    // UNDEFINED" during present when the descriptor set samples from
+    // this image and the fallback CPU-upload path hasn't run for this
+    // texture yet — the visible symptom being MFA's loading-screen /
+    // chopped-corruption pattern that appears stuck through scene
+    // transitions.
+    renderpass_cache.EndRendering();
+    scheduler.Record([image = texture.image](vk::CommandBuffer cmdbuf) {
+        const vk::ImageMemoryBarrier init_barrier = {
+            .srcAccessMask = {},
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                               vk::PipelineStageFlagBits::eFragmentShader,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, init_barrier);
+    });
 }
 
 void RendererVulkan::FillScreen(Common::Vec3<u8> color, const TextureInfo& texture) {

@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <boost/serialization/string.hpp>
 #include <boost/serialization/unordered_map.hpp>
@@ -10,6 +11,7 @@
 #include <boost/serialization/weak_ptr.hpp>
 #include "common/archives.h"
 #include "common/assert.h"
+#include "common/hacks/hack_list.h"
 #include "common/common_types.h"
 #include "common/logging/log.h"
 #include "common/serialization/boost_flat_set.h"
@@ -625,6 +627,12 @@ void CpuLimiterMulti::UpdateAppCpuLimit() {
 bool CpuLimiterMulti::DoTimeLimit(Thread* thread) {
     if (!ready || !active) {
         // Preemption is not active, don't do anything.
+        return false;
+    }
+    // Title-gated (SKIP_CORE1_PREEMPTION): the limiter parks the title's
+    // core-1 worker mid-computation and never reschedules it (Terraria:
+    // world generation stalls forever).
+    if (Common::Hacks::g_skip_core1_preemption.load(std::memory_order_relaxed)) {
         return false;
     }
     if (kernel.ResourceLimit()

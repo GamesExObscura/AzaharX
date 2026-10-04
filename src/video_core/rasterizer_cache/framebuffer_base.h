@@ -4,7 +4,9 @@
 
 #pragma once
 
+#include "common/hacks/hack_list.h"
 #include "common/hash.h"
+#include "common/logging/log.h"
 #include "common/math_util.h"
 #include "video_core/pica/regs_rasterizer.h"
 #include "video_core/rasterizer_cache/slot_id.h"
@@ -111,6 +113,23 @@ public:
 
         if (flip_rect) {
             scissor_rect = scissor_rect.VerticalMirror(height);
+        }
+
+        // FB_CONFIG_DIAG (log only): the FINAL placement — where in the
+        // GL surface this draw actually lands, alongside every input the
+        // computation used. Burst-sampled (prime stride) to defeat
+        // per-frame alternation aliasing.
+        if (Common::Hacks::g_fb_config_diag.load(std::memory_order_relaxed)) {
+            static u32 fbh_tick = 0;
+            if ((fbh_tick++ % 121) < 6) {
+                const auto vp = regs.GetViewportRect();
+                LOG_INFO(HW_GPU,
+                         "[DRAWRECT] flip={} scale={} surf=({},{})-({},{}) "
+                         "vp_pica=({},{})-({},{}) -> draw=({},{})-({},{})",
+                         flip_rect ? 1 : 0, res_scale, surfaces_rect.left, surfaces_rect.bottom,
+                         surfaces_rect.right, surfaces_rect.top, vp.left, vp.bottom, vp.right,
+                         vp.top, draw_rect.left, draw_rect.bottom, draw_rect.right, draw_rect.top);
+            }
         }
     }
 

@@ -223,6 +223,20 @@ private:
     void InvalidateDataCache(Kernel::HLERequestContext& ctx);
 
     /**
+     * GSP_GPU::RequestDma service function
+     *
+     * Copies memory from one address to another.
+     *
+     *  Inputs:
+     *      1 : Source address
+     *      2 : Destination address
+     *      3 : Size in bytes
+     *  Outputs:
+     *      1 : Result of function, 0 on success, otherwise error code
+     */
+    void RequestDma(Kernel::HLERequestContext& ctx);
+
+    /**
      * GSP_GPU::SetLcdForceBlack service function
      *
      * Enable or disable REG_LCDCOLORFILL with the color black.
@@ -392,6 +406,10 @@ private:
     Result AcquireGpuRight(const Kernel::HLERequestContext& ctx,
                            const std::shared_ptr<Kernel::Process>& process, u32 flag,
                            bool blocking);
+
+    /// GSP_DRAIN_QUEUE_ON_ACQUIRE: run commands left in a thread's queue by a
+    /// TriggerCmdReqQueue that arrived while no thread held the GPU right.
+    void DrainCommandQueueOnAcquire(u32 thread_id);
 
     Core::System& system;
 

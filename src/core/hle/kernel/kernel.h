@@ -410,6 +410,24 @@ public:
         return pending_async_operations != 0;
     }
 
+    /// ASYNC_WAKE_SHUTDOWN_GUARD: shared by in-flight HLE async tasks, which check `alive`
+    /// under `mutex` before waking their guest thread. Shutdown clears it first, so a task that
+    /// finishes after Stop (e.g. a SOC Poll timing out) no longer schedules onto a destroyed
+    /// kernel and timing system.
+    struct AsyncWakeGuard {
+        std::mutex mutex;
+        bool alive = true;
+    };
+
+    std::shared_ptr<AsyncWakeGuard> GetAsyncWakeGuard() const {
+        return async_wake_guard;
+    }
+
+    void DisableAsyncWakes() {
+        std::scoped_lock lock{async_wake_guard->mutex};
+        async_wake_guard->alive = false;
+    }
+
     void UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
                                  New3dsHwCapabilities n3ds_hw_cap);
 
@@ -431,6 +449,8 @@ private:
     std::atomic<u32> next_object_id{0};
 
     std::atomic<int> pending_async_operations{};
+
+    std::shared_ptr<AsyncWakeGuard> async_wake_guard = std::make_shared<AsyncWakeGuard>();
 
     // Note: keep the member order below in order to perform correct destruction.
     // Thread manager is destructed before process list in order to Stop threads and clear thread

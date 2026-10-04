@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <set>
+#include <tuple>
 #include <glad/glad.h>
 #include "common/assert.h"
 #include "common/settings.h"
@@ -69,6 +71,28 @@ static void APIENTRY DebugHandler(GLenum source, GLenum type, GLuint id, GLenum 
         level = Common::Log::Level::Debug;
         break;
     }
+    // [FB-WHO] GL_INVALID_FRAMEBUFFER_OPERATION tells us an incomplete
+    // framebuffer was bound but not WHICH one. Debug output is synchronous,
+    // so the binding here is still the one that faulted. Report the draw and
+    // read FBO handles plus their completeness, deduped, so the offending
+    // object can be matched against the handle logged at construction —
+    // this distinguishes a bad draw target from a bad presentation/blit one.
+    if (id == 1286) {
+        GLint draw_fbo = 0, read_fbo = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+        const GLenum draw_status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+        const GLenum read_status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+        static std::set<std::tuple<GLint, GLint, GLenum, GLenum>> seen;
+        const auto key = std::make_tuple(draw_fbo, read_fbo, draw_status, read_status);
+        if (seen.size() < 32 && seen.insert(key).second) {
+            LOG_CRITICAL(Render_OpenGL,
+                         "[FB-WHO] 1286 with draw_fbo={} (status={:#X}) read_fbo={} (status={:#X})",
+                         draw_fbo, draw_status, read_fbo, read_status);
+        }
+        return; // suppress the 1286 spam; [FB-WHO] carries the information
+    }
+
     LOG_GENERIC(Common::Log::Class::Render_OpenGL, level, "{} {} {}: {}", GetSource(source),
                 GetType(type), id, message);
 }

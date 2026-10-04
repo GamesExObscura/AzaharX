@@ -130,6 +130,14 @@ public:
         return swizzle_data;
     }
 
+    /// True after program code / swizzle data actually changed and before the next hash.
+    bool IsProgramCodeHashDirty() const {
+        return program_code_hash_dirty;
+    }
+    bool IsSwizzleDataHashDirty() const {
+        return swizzle_data_hash_dirty;
+    }
+
     u32 GetBiggestProgramSize() const {
         return biggest_program_size;
     }

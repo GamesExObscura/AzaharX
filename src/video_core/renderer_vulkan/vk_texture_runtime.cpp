@@ -795,6 +795,11 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
             vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTopOfPipe,
             vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, num_images, barriers.data());
     });
+    // Force the barrier chunk to be sent to the worker thread so the init transition
+    // is guaranteed to be recorded into a command buffer that submits before any
+    // draw using these images. Without this, the layout transition can race with
+    // draw recording, leaving images in UNDEFINED layout at submit time (black render).
+    scheduler.DispatchWork();
 }
 
 Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface,
@@ -844,6 +849,9 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
             vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTopOfPipe,
             vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, num_images, barriers.data());
     });
+    // See comment in the other constructor: force barrier dispatch to prevent
+    // race with draw recording.
+    scheduler.DispatchWork();
 
     custom_format = mat->format;
     material = mat;
@@ -1128,6 +1136,8 @@ void Surface::ScaleUp(u32 new_scale) {
                                    vk::PipelineStageFlagBits::eTopOfPipe,
                                    vk::DependencyFlagBits::eByRegion, {}, {}, barriers);
         });
+    // Force barrier dispatch — see comment in Surface constructors above.
+    scheduler.DispatchWork();
 
     for (u32 level = 0; level < levels; level++) {
         const VideoCore::TextureBlit blit = {

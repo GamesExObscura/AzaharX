@@ -138,6 +138,21 @@ public:
     /// Clear all cached resources tracked by this cache manager
     void ClearAll(bool flush);
 
+    /// Counter bumped by every operation that changes the cache state a framebuffer or texture
+    /// lookup depends on (surface creation/removal, validation uploads, flushes, invalidations
+    /// that touch another surface). Used by DRAW_LOOKUP_REUSE: while it is unchanged, repeating
+    /// a lookup with the same registers returns the same surfaces and does no work.
+    u64 MutationGeneration() const noexcept {
+        return mutation_gen;
+    }
+
+    /// True when part of the region holds GPU-written data not yet flushed to guest memory
+    /// (FlushRegion on it would download).
+    bool IsRegionGpuDirty(PAddr addr, u32 size) const {
+        return size != 0 && dirty_regions.find(SurfaceInterval(addr, addr + size)) !=
+                                dirty_regions.end();
+    }
+
 private:
     /// Iterate over all page indices in a range
     template <typename Func>
@@ -228,6 +243,7 @@ private:
     PageMap cached_pages;
     u32 resolution_scale_factor;
     u64 frame_tick{};
+    u64 mutation_gen{};
     FramebufferParams fb_params;
     Settings::TextureFilter filter;
     bool dump_textures;

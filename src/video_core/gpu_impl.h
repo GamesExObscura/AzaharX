@@ -35,6 +35,14 @@ struct GPU::Impl {
     std::unique_ptr<SwRenderer::SwBlitter> sw_blitter;
     Core::TimingEventType* vblank_event;
     Service::GSP::InterruptHandler signal_interrupt;
+    // GX completion-IRQ delay (see HackType::GX_COMPLETION_IRQ_DELAY).
+    // raw_interrupt_handler is the unwrapped GSP handler used by the
+    // delayed-delivery timing event; delay_completion_irq gates the
+    // wrapping. completion_irq_event carries the InterruptId as
+    // user_data.
+    Core::TimingEventType* completion_irq_event{};
+    Service::GSP::InterruptHandler raw_interrupt_handler;
+    bool delay_completion_irq{false};
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)

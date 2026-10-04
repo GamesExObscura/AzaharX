@@ -2,14 +2,18 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <bitset>
+#include <cstddef>
 #include "common/arch.h"
 #include "common/archives.h"
+#include "common/hacks/hack_list.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "common/hacks/hack_manager.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
@@ -137,6 +141,52 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) {
     }
 }
 
+/// DRAW_LOOKUP_REUSE: registers whose writes never change what an accelerated draw renders
+/// beyond its own vertices: the per-draw vertex source/count/trigger registers, IRQ and
+/// command-buffer control, gpu_mode, and the index/data ports whose effect is tracked by their
+/// own change flags (shader uniforms/code/swizzles, LUT data). Writes to any other register
+/// that change its value break a draw merge.
+static bool IsDrawMergeNeutralReg(u32 id) {
+    static const std::bitset<RegsInternal::NUM_REGS> neutral = [] {
+        std::bitset<RegsInternal::NUM_REGS> set;
+        const auto range = [&set](u32 first, u32 count) {
+            for (u32 i = 0; i < count; ++i) {
+                set.set(first + i);
+            }
+        };
+        range(0x000, PICA_REG_INDEX(rasterizer)); // IRQ request/compare/mask/autostop
+        range(PICA_REG_INDEX(pipeline.vertex_attributes), 1); // vertex base address
+        for (u32 loader = 0; loader < 12; ++loader) {
+            range(PICA_REG_INDEX(pipeline.vertex_attributes.attribute_loaders[0]) + loader * 3,
+                  1); // loader data offset
+        }
+        range(PICA_REG_INDEX(pipeline.index_array), 1);
+        range(PICA_REG_INDEX(pipeline.num_vertices), 1);
+        range(PICA_REG_INDEX(pipeline.vertex_offset), 1);
+        range(PICA_REG_INDEX(pipeline.trigger_draw), 2);
+        range(PICA_REG_INDEX(pipeline.command_buffer), 6);
+        range(PICA_REG_INDEX(pipeline.gpu_mode), 1);
+        range(0x253, 1); // unused by Azahar; toggled around draws
+        range(PICA_REG_INDEX(pipeline.restart_primitive), 1);
+        for (const u32 unit : {PICA_REG_INDEX(vs), PICA_REG_INDEX(gs)}) {
+            const u32 setup = unit + offsetof(ShaderRegs, uniform_setup) / sizeof(u32);
+            const u32 program = unit + offsetof(ShaderRegs, program) / sizeof(u32);
+            const u32 swizzle = unit + offsetof(ShaderRegs, swizzle_patterns) / sizeof(u32);
+            range(setup, 9);
+            range(program, 9);
+            range(swizzle, 9);
+        }
+        range(PICA_REG_INDEX(lighting.lut_config), 1);
+        range(PICA_REG_INDEX(lighting.lut_data), 8);
+        range(PICA_REG_INDEX(texturing.fog_lut_offset), 1);
+        range(PICA_REG_INDEX(texturing.fog_lut_data), 8);
+        range(PICA_REG_INDEX(texturing.proctex_lut_config), 1);
+        range(PICA_REG_INDEX(texturing.proctex_lut_data), 8);
+        return set;
+    }();
+    return neutral.test(id);
+}
+
 static bool any_byte_match(u32 a, u32 b) {
     return ((a & 0xFF) == (b & 0xFF)) || (((a >> 8) & 0xFF) == ((b >> 8) & 0xFF)) ||
            (((a >> 16) & 0xFF) == ((b >> 16) & 0xFF)) || (((a >> 24) & 0xFF) == ((b >> 24) & 0xFF));
@@ -164,6 +214,18 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     const u32 old_value = regs.internal.reg_array[id];
     const u32 write_mask = ExpandBitsToBytes[mask];
     regs.internal.reg_array[id] = (old_value & ~write_mask) | (value & write_mask);
+
+    // DRAW_LOOKUP_REUSE: see draw_merge_breaks.
+    const bool track_merge = Common::Hacks::g_draw_lookup_reuse.load(std::memory_order_relaxed);
+    if (track_merge && regs.internal.reg_array[id] != old_value && !IsDrawMergeNeutralReg(id)) {
+        ++draw_merge_breaks;
+    }
+
+    // ([CBADDR] / [REGSET] diagnostics removed 2026-07-25. Both sat in this
+    // per-register-write hot path and each emitted ~17,000 LOG_CRITICAL calls
+    // per session — their value-dedupe never fired because the colour-buffer
+    // address alternates every draw. The LEGO HP 5-7 / SW III question they
+    // were built to answer is solved: DISABLE_GPU_TIMING_SIM.)
 
     // Track register write.
     DebugUtils::OnPicaRegWrite(id, mask, regs.internal.reg_array[id]);
@@ -262,6 +324,12 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     case PICA_REG_INDEX(gs.program.set_word[6]):
     case PICA_REG_INDEX(gs.program.set_word[7]): {
         u32& offset = regs.internal.gs.program.offset;
+        // FORCE_VALIDATED_PICA_INDEX: wrap like hardware instead of dropping.
+        if (offset >= 4096 &&
+            Common::Hacks::g_force_validated_pica_index.load(std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU, "[ZPICA] wrapping GS program offset {}", offset);
+            offset %= 4096;
+        }
         if (offset >= 4096) {
             LOG_ERROR(HW_GPU, "Invalid GS program offset {}", offset);
         } else {
@@ -280,6 +348,12 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     case PICA_REG_INDEX(gs.swizzle_patterns.set_word[6]):
     case PICA_REG_INDEX(gs.swizzle_patterns.set_word[7]): {
         u32& offset = regs.internal.gs.swizzle_patterns.offset;
+        // FORCE_VALIDATED_PICA_INDEX: wrap like hardware instead of dropping.
+        if (offset >= gs_setup.GetSwizzleData().size() &&
+            Common::Hacks::g_force_validated_pica_index.load(std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU, "[ZPICA] wrapping GS swizzle offset {}", offset);
+            offset %= static_cast<u32>(gs_setup.GetSwizzleData().size());
+        }
         if (offset >= gs_setup.GetSwizzleData().size()) {
             LOG_ERROR(HW_GPU, "Invalid GS swizzle pattern offset {}", offset);
         } else {
@@ -342,6 +416,12 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     case PICA_REG_INDEX(vs.program.set_word[6]):
     case PICA_REG_INDEX(vs.program.set_word[7]): {
         u32& offset = regs.internal.vs.program.offset;
+        // FORCE_VALIDATED_PICA_INDEX: wrap like hardware instead of dropping.
+        if (offset >= 512 &&
+            Common::Hacks::g_force_validated_pica_index.load(std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU, "[ZPICA] wrapping VS program offset {}", offset);
+            offset %= 512;
+        }
         if (offset >= 512) {
             LOG_ERROR(HW_GPU, "Invalid VS program offset {}", offset);
         } else {
@@ -364,6 +444,12 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     case PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]):
     case PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]): {
         u32& offset = regs.internal.vs.swizzle_patterns.offset;
+        // FORCE_VALIDATED_PICA_INDEX: wrap like hardware instead of dropping.
+        if (offset >= vs_setup.GetSwizzleData().size() &&
+            Common::Hacks::g_force_validated_pica_index.load(std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU, "[ZPICA] wrapping VS swizzle offset {}", offset);
+            offset %= static_cast<u32>(vs_setup.GetSwizzleData().size());
+        }
         if (offset >= vs_setup.GetSwizzleData().size()) {
             LOG_ERROR(HW_GPU, "Invalid VS swizzle pattern offset {}", offset);
         } else {
@@ -390,6 +476,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
 
         const u32 prev = std::exchange(lighting.luts[lut_config.type][lut_config.index].raw, value);
         lighting.lut_dirty |= (prev != value) << lut_config.type;
+        draw_merge_breaks += track_merge && prev != value;
         lut_config.index.Assign(lut_config.index + 1);
         break;
     }
@@ -405,6 +492,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
         const u32 prev =
             std::exchange(fog.lut[regs.internal.texturing.fog_lut_offset % 128].raw, value);
         fog.lut_dirty |= prev != value;
+        draw_merge_breaks += track_merge && prev != value;
         regs.internal.texturing.fog_lut_offset.Assign(regs.internal.texturing.fog_lut_offset + 1);
         break;
     }
@@ -423,6 +511,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
         const auto sync_lut = [&](auto& proctex_table) {
             const u32 prev = std::exchange(proctex_table[index % proctex_table.size()].raw, value);
             proctex.table_dirty |= (prev != value) << u32(lut_table);
+            draw_merge_breaks += track_merge && prev != value;
         };
 
         switch (lut_table) {
@@ -466,8 +555,15 @@ void PicaCore::SubmitImmediate(u32 value) {
 
     auto& setup = regs.internal.pipeline.vs_default_attributes_setup;
     if (setup.index > IMMEDIATE_MODE_INDEX) {
-        LOG_ERROR(HW_GPU, "Invalid VS default attribute index {}", setup.index);
-        return;
+        // FORCE_VALIDATED_PICA_INDEX: mask to the 4-bit range like hardware
+        // instead of dropping the attribute write.
+        if (Common::Hacks::g_force_validated_pica_index.load(std::memory_order_relaxed)) {
+            LOG_INFO(HW_GPU, "[ZPICA] masking VS default attribute index {}", setup.index);
+            setup.index = setup.index & IMMEDIATE_MODE_INDEX;
+        } else {
+            LOG_ERROR(HW_GPU, "Invalid VS default attribute index {}", setup.index);
+            return;
+        }
     }
 
     // Retrieve the attribute and place it in the default attribute buffer.

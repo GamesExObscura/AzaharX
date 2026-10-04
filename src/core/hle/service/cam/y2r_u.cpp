@@ -3,9 +3,12 @@
 // Refer to the license.txt file included.
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include "common/archives.h"
 #include "common/common_funcs.h"
+#include "common/hacks/hack_list.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
@@ -518,6 +521,7 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
     // dst_image_size would seem to be perfect for this, but it doesn't include the gap :(
     u32 total_output_size =
         conversion.input_lines * (conversion.dst.transfer_unit + conversion.dst.gap);
+
     system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
                                                  Memory::FlushMode::FlushAndInvalidate);
 
@@ -546,6 +550,16 @@ void Y2R_U::StopConversion(Kernel::HLERequestContext& ctx) {
     if (is_busy_conversion) {
         is_busy_conversion = false;
         system.CoreTiming().RemoveEvent(completion_signal_event);
+        // Disney Infinity fix (title-gated): the conversion work already
+        // completed synchronously in StartConversion — the scheduled event
+        // is only a delayed notification. Cancelling it here strands any
+        // thread waiting on Y2R:Completed forever when the game's AV
+        // dispatcher calls StopConversion inside the notification window
+        // (DI video thread stalls ~2s per frame until an unrelated retry).
+        // Deliver the completion instead of dropping it.
+        if (Common::Hacks::g_right_eye_display_fallback.load(std::memory_order_relaxed)) {
+            completion_event->Signal();
+        }
     }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);

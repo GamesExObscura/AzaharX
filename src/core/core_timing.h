@@ -236,6 +236,11 @@ public:
         // under/overclocking the guest cpu
         double cpu_clock_scale = 1.0;
 
+        // Which core this timer belongs to (set by Timing's constructor).
+        // Used by the title-gated CORE_DOWNCOUNT_HACK to select its
+        // per-core downcount shift. Not serialized: reconstructed on boot.
+        std::size_t core_index = 0;
+
         template <class Archive>
         void serialize(Archive& ar, const unsigned int) {
             MoveEvents();

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include "common/hacks/hack_list.h"
 #include "common/assert.h"
 #include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
@@ -185,7 +186,41 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
 
     LOG_TRACE(Service, "{}",
               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+
+    // FS_SAVE_DIAG: trace every filesystem command and its reply. File and
+    // Directory sessions register with an empty service name, so matching
+    // "" as well as the fs:* ports captures the whole save conversation --
+    // which is the only way to see what happens BETWEEN an OpenFile and the
+    // Close that follows it.
+    // [SVC] Capped, name-only trace of every service command, for diffing the
+    // call sequence against Citra 2104 on a title that renders there and not
+    // here. Names only (no args) so the two sequences line up positionally.
+    // Now carries ARGS and RESULT: the call sequence is identical to Citra for
+    // the first ~109 calls, so the game must be receiving a different ANSWER
+    // somewhere in there. Names alone cannot show that.
+    // ([SVC] call-sequence dump removed 2026-07-25: it was UNGATED in this
+    // service-dispatch path, running for every service call in every game.
+    // It proved the call sequence AND results identical to Citra 2104, so it
+    // has served its purpose. The gated FS trace below is retained.)
+    const bool fs_trace = Common::Hacks::g_fs_save_diag.load(std::memory_order_relaxed) &&
+                          (service_name.empty() || service_name.compare(0, 2, "fs") == 0);
+    if (!fs_trace) {
+        handler_invoker(this, info->handler_callback, context);
+        return;
+    }
+
+    const std::string port = service_name.empty() ? std::string("session") : service_name;
+    {
+        const u32* cb = context.CommandBuffer();
+        LOG_INFO(Service_FS, "[FS-TRACE] -> {}::{} args={:#x} {:#x} {:#x} {:#x}", port, info->name,
+                 cb[1], cb[2], cb[3], cb[4]);
+    }
     handler_invoker(this, info->handler_callback, context);
+    {
+        const u32* cb = context.CommandBuffer();
+        LOG_INFO(Service_FS, "[FS-TRACE] <- {}::{} result={:#010x} out={:#x} {:#x}", port,
+                 info->name, cb[1], cb[2], cb[3]);
+    }
 }
 
 std::string ServiceFrameworkBase::GetFunctionName(IPC::Header header) const {

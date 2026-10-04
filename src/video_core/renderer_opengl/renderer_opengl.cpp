@@ -2,8 +2,13 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+
 #include "common/logging/log.h"
 #include "common/microprofile.h"
+#include "common/hacks/hack_list.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
@@ -89,6 +94,8 @@ RendererOpenGL::RendererOpenGL(Core::System& system, Pica::PicaCore& pica_,
 RendererOpenGL::~RendererOpenGL() = default;
 
 void RendererOpenGL::SwapBuffers() {
+    // DRAW_LOOKUP_REUSE: issue merged draws while the GL state is still theirs.
+    rasterizer.FlushDrawMerge();
     system.perf_stats->StartSwap();
     // Maintain the rasterizer's state as a priority
     OpenGLState prev_state = OpenGLState::GetCurState();
@@ -196,6 +203,23 @@ void RendererOpenGL::PrepareRendertarget() {
         auto& texture = screen_infos[i].texture;
 
         const auto color_fill = fb_id == 0 ? regs_lcd.color_fill_top : regs_lcd.color_fill_bottom;
+
+        // FB_CONFIG_DIAG (log only): what is each screen actually handed?
+        if (Common::Hacks::g_fb_config_diag.load(std::memory_order_relaxed)) {
+            // Per-screen counters: a single shared counter with a modulus
+            // divisible by the 3 screens only ever samples the same one.
+            static u32 fbcfg_tick[3] = {};
+            if ((fbcfg_tick[i]++ % 60) == 0) {
+                LOG_INFO(Render_OpenGL,
+                         "[FBCFG] i={} fb_id={} L1=0x{:08X} L2=0x{:08X} R1=0x{:08X} R2=0x{:08X} "
+                         "{}x{} stride={} fill={}",
+                         i, fb_id, framebuffer.address_left1, framebuffer.address_left2,
+                         framebuffer.address_right1, framebuffer.address_right2,
+                         framebuffer.width.Value(), framebuffer.height.Value(), framebuffer.stride,
+                         color_fill.is_enabled ? 1 : 0);
+            }
+        }
+
         if (color_fill.is_enabled) {
             // Resize the texture to let it be reconfigured
             texture.width = 1;
@@ -214,6 +238,7 @@ void RendererOpenGL::RenderToMailbox(const Layout::FramebufferLayout& layout,
                                      std::unique_ptr<Frontend::TextureMailbox>& mailbox,
                                      bool flipped) {
     if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
+        Common::Hacks::g_force_present_every_frame.load(std::memory_order_relaxed) ||
         Core::PerfStats::game_frames_updated) {
         Frontend::Frame* frame;
         {
@@ -276,26 +301,83 @@ void RendererOpenGL::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
     if (framebuffer.address_right1 == 0 || framebuffer.address_right2 == 0)
         right_eye = false;
 
-    const PAddr framebuffer_addr =
+    PAddr framebuffer_addr =
         framebuffer.active_fb == 0
             ? (!right_eye ? framebuffer.address_left1 : framebuffer.address_right1)
             : (!right_eye ? framebuffer.address_left2 : framebuffer.address_right2);
+
+    // Title-gated (RIGHT_EYE_DISPLAY_FALLBACK, currently Disney
+    // Infinity): the game programs a ZERO left-eye address and puts the
+    // real frame in the right-eye slot — present that instead. Runs
+    // globally in no other title: the same fallback applied everywhere
+    // caused the "VHS tape" corruption in heavy 3D games.
+    bool using_fb_fallback = false;
+    const bool fb_fallback_hack =
+        Common::Hacks::g_right_eye_display_fallback.load(std::memory_order_relaxed);
+
+    if (fb_fallback_hack && framebuffer_addr == 0) {
+        framebuffer_addr = framebuffer.active_fb == 0 ? framebuffer.address_right1
+                                                      : framebuffer.address_right2;
+        using_fb_fallback = true;
+        if (framebuffer_addr == 0) {
+            // Nothing valid to present this frame; keep the previous image.
+            return;
+        }
+    }
+
+    // Title-gated (KEEP_LAST_FRAME_ON_ZERO_FB): the game zeroed this
+    // screen's framebuffer address (Skylanders Giants / Swap Force do it
+    // to the bottom screen during videos). Keep the previous image
+    // instead of presenting from address 0, which shows black. The
+    // pre-port fork's early return ran before the color-fill handling,
+    // so a zero address wins over an enabled fill here too.
+    const bool keep_zero_fb =
+        Common::Hacks::g_keep_last_frame_on_zero_fb.load(std::memory_order_relaxed);
+    if (keep_zero_fb && framebuffer_addr == 0) {
+        return;
+    }
 
     LOG_TRACE(Render_OpenGL, "0x{:08x} bytes from 0x{:08x}({}x{}), fmt {:x}",
               framebuffer.stride * framebuffer.height, framebuffer_addr, framebuffer.width.Value(),
               framebuffer.height.Value(), framebuffer.format);
 
     int bpp = Pica::BytesPerPixel(framebuffer.color_format);
-    std::size_t pixel_stride = framebuffer.stride / bpp;
+    std::size_t pixel_stride;
+    if (fb_fallback_hack && framebuffer.stride == 0) {
+        // Fallback path quirk: stride reads 0; the buffer is tightly
+        // packed RGB8 (observed on the working pre-port build).
+        bpp = 3;
+        pixel_stride = framebuffer.width;
+    } else {
+        pixel_stride = framebuffer.stride / bpp;
 
-    // OpenGL only supports specifying a stride in units of pixels, not bytes, unfortunately
-    ASSERT(pixel_stride * bpp == framebuffer.stride);
+        // OpenGL only supports specifying a stride in units of pixels, not bytes, unfortunately
+        ASSERT(pixel_stride * bpp == framebuffer.stride);
 
-    // Ensure no bad interactions with GL_UNPACK_ALIGNMENT, which by default
-    // only allows rows to have a memory alignement of 4.
-    ASSERT(pixel_stride % 4 == 0);
+        // Ensure no bad interactions with GL_UNPACK_ALIGNMENT, which by default
+        // only allows rows to have a memory alignement of 4.
+        ASSERT(pixel_stride % 4 == 0);
+    }
 
-    if (color_fill.is_enabled ||
+    // Under the DI gate, ALWAYS take the CPU-upload path. FB-DIAG showed
+    // the failing phase presents CPU-composed FCRAM buffers with valid
+    // addresses; AccelerateDisplay matches them to a stale GPU surface
+    // and presents old/black content. The pre-port build worked because
+    // its older cache missed here and read guest memory directly.
+    // Under the Giants/Swap Force gate, force the CPU-upload path for
+    // the BOTTOM screen only: their during-video copyright card is
+    // CPU-composed into FCRAM, and AccelerateDisplay matches that
+    // address to a stale GPU surface and presents black (same failure
+    // class as DI's boot phase; the pre-port cache missed here and read
+    // guest memory directly). Top screen stays accelerated.
+    // FORCE_CPU_BOTTOM_SCREEN exposes the same bottom-screen CPU-upload
+    // path on its own, for titles whose bottom screen gets a valid
+    // framebuffer but presents black via the accelerated path.
+    const bool force_cpu_bottom =
+        (keep_zero_fb ||
+         Common::Hacks::g_force_cpu_bottom_screen.load(std::memory_order_relaxed)) &&
+        (&screen_info == &screen_infos[2]);
+    if (color_fill.is_enabled || fb_fallback_hack || force_cpu_bottom ||
         !rasterizer.AccelerateDisplay(framebuffer, framebuffer_addr, static_cast<u32>(pixel_stride),
                                       screen_info)) {
         u32 width = framebuffer.width;
@@ -305,9 +387,39 @@ void RendererOpenGL::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
         screen_info.display_texture = screen_info.texture.resource.handle;
         screen_info.display_texcoords = Common::Rectangle<f32>(0.f, 0.f, 1.f, 1.f);
 
-        rasterizer.FlushRegion(framebuffer_addr, framebuffer.stride * framebuffer.height);
+        u32 flush_stride = framebuffer.stride;
+        if (flush_stride == 0) {
+            flush_stride = static_cast<u32>(pixel_stride * bpp);
+        }
+        // (Flush-skip experiment 2026-07-08: skipping this for DI made
+        // even the intros black — guest memory never holds the pixels;
+        // the flush writeback is what makes the CPU present work. The
+        // black-screen root cause is the game stalling at 1 fps, not
+        // the display path.)
+        rasterizer.FlushRegion(framebuffer_addr, flush_stride * framebuffer.height);
 
         u8* framebuffer_data = system.Memory().GetPhysicalPointer(framebuffer_addr);
+
+        // Giants/Swap Force bottom screen: mid-video the flush pulls a
+        // stale all-black surface over the CPU-composed copyright card
+        // for a stretch (the game repaints it at the video's end). If
+        // the frame about to be presented is entirely black, keep the
+        // previous image instead; anything non-black presents normally.
+        if (force_cpu_bottom && framebuffer_data != nullptr && !color_fill.is_enabled) {
+            const u32 frame_size = flush_stride * framebuffer.height;
+            bool all_zero = true;
+            for (u32 i = 0; i + 8 <= frame_size; i += 8) {
+                u64 chunk;
+                std::memcpy(&chunk, framebuffer_data + i, 8);
+                if (chunk != 0) {
+                    all_zero = false;
+                    break;
+                }
+            }
+            if (all_zero) {
+                return;
+            }
+        }
 
         if (color_fill.is_enabled) {
             memcpy(fill_pixel, color_fill.AsVector().AsArray(), sizeof(fill_pixel));
@@ -328,8 +440,16 @@ void RendererOpenGL::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
         //       they differ from the LCD resolution.
         // TODO: Applications could theoretically crash Citra here by specifying too large
         //       framebuffer sizes. We should make sure that this cannot happen.
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, screen_info.texture.gl_format,
-                        screen_info.texture.gl_type, framebuffer_data);
+        GLenum upload_format = screen_info.texture.gl_format;
+        GLenum upload_type = screen_info.texture.gl_type;
+        if (using_fb_fallback) {
+            // The right-eye fallback buffer is packed BGR (see the
+            // stride-0 quirk above).
+            upload_format = GL_BGR;
+            upload_type = GL_UNSIGNED_BYTE;
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, upload_format, upload_type,
+                        framebuffer_data);
 
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 

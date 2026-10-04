@@ -2,9 +2,13 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <string_view>
 #include <fmt/format.h>
 
+#include "common/hacks/hack_list.h"
+#include "common/hash.h"
+#include "common/logging/log.h"
 #include "video_core/pica/regs_rasterizer.h"
 #include "video_core/shader/generator/glsl_shader_decompiler.h"
 #include "video_core/shader/generator/glsl_shader_gen.h"
@@ -13,6 +17,58 @@
 using VSOutputAttributes = Pica::RasterizerRegs::VSOutputAttributes;
 
 namespace Pica::Shader::Generator::GLSL {
+
+// PMG3D: when set, generated FS samples tex0 at base mip (textureLod = 0).
+// Read by glsl_fs_shader_gen.cpp via the extern below.
+// Title-gated via HackType::PMG3D_FORCE_WHITE_AMBIENT, set from gpu.cpp.
+std::atomic<bool> g_pmg3d_force_lod0{false};
+
+void EnablePmg3dForceLod0(bool enable) {
+    g_pmg3d_force_lod0.store(enable, std::memory_order_relaxed);
+}
+
+// The primary_color assignment for the vertex / fixed-geometry shaders. PICA takes abs() and
+// saturates vertex colors to [0,1] before interpolation; the 2.0 headroom is the Disney Princess
+// overbright change. Titles armed with HackType::HW_VERTEX_COLOR_SATURATE get the hardware rule.
+static const char* PrimaryColorExpr() {
+    return Common::Hacks::g_hw_vertex_color_saturate.load(std::memory_order_relaxed)
+               ? "    primary_color = min(abs(vtx_color), vec4(1.0));\n\n"
+               : "    primary_color = clamp(abs(vtx_color), vec4(0.0), vec4(2.0));\n\n";
+}
+
+// PMG3D: when set, all VS / fixed-GS sites that would normally emit
+// `gl_ClipDistance[0] = -vtx_pos.z` emit `1.0` instead so the PICA z<=0
+// clip plane never discards. Title-gated via HackType::PMG3D_RELAX_CLIP_PLANE.
+static std::atomic<bool> g_pmg3d_relax_clip_plane{false};
+
+void EnablePmg3dRelaxClipPlane(bool enable) {
+    g_pmg3d_relax_clip_plane.store(enable, std::memory_order_relaxed);
+}
+
+// Returns the GLSL assigned to gl_ClipDistance[0]. Relaxes when PMG3D
+// forces the bypass. The relaxed form also pushes any vertex that
+// WOULD have been clipped (natural clip value negative) to the far
+// plane: forcing clip to always-pass proved to bury PMG3D's real 3D
+// geometry (building/host/doors) because the forced-through 2D draws
+// carry near-plane-ish z and stomp the depth buffer. At the far plane
+// they remain visible wherever nothing else draws (backgrounds/logos)
+// but can never occlude correctly-projected 3D content.
+static const char* ClipDistance0Expr() {
+    // Relaxed form: would-be-clipped vertices are remapped into a thin
+    // depth band just inside the far plane, PRESERVING their relative
+    // ordering (t = original ndc z, clamped to [-1,0)). A flat push to
+    // exactly the far plane made every forced layer z-fight its
+    // neighbors (background flicker) and collapsed intended layering
+    // (elevator interior, intro trees).
+    return g_pmg3d_relax_clip_plane.load(std::memory_order_relaxed)
+               ? "1.0; if (gl_Position.z < 0.0) { "
+                 "float t_pmg = pow(clamp(-gl_Position.z / max(gl_Position.w, 0.000001), 0.0, 1.0), 0.2); "
+                 "gl_Position.z = gl_Position.w * (1.0 - 0.002 * t_pmg); } "
+                 "/* PMG3D: pass PICA z<=0 clip; nonlinear ordered far band — "
+                 "pow(|t|,0.2) expands clustered small z so layers separate within "
+                 "the ~0.2% depth headroom behind the real 3D scene */"
+               : "-vtx_pos.z";
+}
 
 constexpr std::string_view VSPicaUniformBlockDef = R"(
 #ifdef VULKAN
@@ -126,8 +182,10 @@ void main() {
     gl_Position = vec4(vtx_pos.x, vtx_pos.y, -vtx_pos.z, vtx_pos.w);
 )";
     if (use_clip_planes) {
+        out += "        gl_ClipDistance[0] = ";
+        out += ClipDistance0Expr();
+        out += "; // fixed PICA clipping plane z <= 0\n";
         out += R"(
-        gl_ClipDistance[0] = -vtx_pos.z; // fixed PICA clipping plane z <= 0
         if (enable_clip1) {
             gl_ClipDistance[1] = dot(clip_coef, vtx_pos);
         } else {
@@ -247,7 +305,10 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
         out += "    }\n";
         out += "    gl_Position = vec4(vtx_pos.x, vtx_pos.y, -vtx_pos.z, vtx_pos.w);\n";
         if (extra.use_clip_planes) {
-            out += "    gl_ClipDistance[0] = -vtx_pos.z;\n"; // fixed PICA clipping plane z <= 0
+            // fixed PICA clipping plane z <= 0 (relaxed under PMG3D)
+            out += "    gl_ClipDistance[0] = ";
+            out += ClipDistance0Expr();
+            out += ";\n";
             out += "    if (enable_clip1) {\n";
             out += "        gl_ClipDistance[1] = dot(clip_coef, vtx_pos);\n";
             out += "    } else {\n";
@@ -260,7 +321,13 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
                semantic(VSOutputAttributes::COLOR_G) + ", " +
                semantic(VSOutputAttributes::COLOR_B) + ", " +
                semantic(VSOutputAttributes::COLOR_A) + ");\n";
-        out += "    primary_color = min(abs(vtx_color), vec4(1.0));\n\n";
+        // Disney Princess (and likely other games) writes overbright vertex colors
+    // expecting a subsequent texture-modulate to bring them back into [0,1].
+    // The old hard clamp to 1.0 killed that headroom and made pink fabric render
+    // as burgundy after `PrimaryColor * Texture0`. Allow up to 2.0 so the multiply
+    // stage has room to work; the framebuffer write will clamp the final pixel.
+    // (HW_VERTEX_COLOR_SATURATE titles keep the hardware [0,1] clamp.)
+    out += PrimaryColorExpr();
 
         out += "    texcoord0 = vec2(" + semantic(VSOutputAttributes::TEXCOORD0_U) + ", " +
                semantic(VSOutputAttributes::TEXCOORD0_V) + ");\n";
@@ -291,7 +358,9 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
     for (u32 i = 0; i < config.state.num_outputs; ++i) {
         out += fmt::format("    vs_out_attr{} = vec4(0.0, 0.0, 0.0, 1.0);\n", i);
     }
-    out += "\n    exec_shader();\n    EmitVtx();\n}\n\n";
+    out += "\n    exec_shader();\n    EmitVtx();\n";
+
+    out += "}\n\n";
 
     out += program_source;
 
@@ -349,7 +418,14 @@ struct Vertex {
     out += "    }\n";
     out += "    gl_Position = vec4(vtx_pos.x, vtx_pos.y, -vtx_pos.z, vtx_pos.w);\n";
     if (extra.use_clip_planes) {
-        out += "    gl_ClipDistance[0] = -vtx_pos.z;\n"; // fixed PICA clipping plane z <= 0
+        // Fixed PICA clipping plane z <= 0 — ALWAYS strict on the GS
+        // path. This path renders the lit 3D meshes (PMG3D: building,
+        // host, doors), which render correctly with natural clipping
+        // and BREAK when relaxed. The PMG3D clip relax now applies
+        // only to the VS / trivial-GS sites above, which carry the
+        // unlit 2D draws (logos, UI, signs, backgrounds) whose
+        // negative-z vertices need the bypass.
+        out += "    gl_ClipDistance[0] = -vtx_pos.z;\n";
         out += "    if (enable_clip1) {\n";
         out += "        gl_ClipDistance[1] = dot(clip_coef, vtx_pos);\n";
         out += "    } else {\n";
@@ -363,7 +439,13 @@ struct Vertex {
     out += "    vec4 vtx_color = vec4(" + semantic(VSOutputAttributes::COLOR_R) + ", " +
            semantic(VSOutputAttributes::COLOR_G) + ", " + semantic(VSOutputAttributes::COLOR_B) +
            ", " + semantic(VSOutputAttributes::COLOR_A) + ");\n";
-    out += "    primary_color = min(abs(vtx_color), vec4(1.0));\n\n";
+    // Disney Princess (and likely other games) writes overbright vertex colors
+    // expecting a subsequent texture-modulate to bring them back into [0,1].
+    // The old hard clamp to 1.0 killed that headroom and made pink fabric render
+    // as burgundy after `PrimaryColor * Texture0`. Allow up to 2.0 so the multiply
+    // stage has room to work; the framebuffer write will clamp the final pixel.
+    // (HW_VERTEX_COLOR_SATURATE titles keep the hardware [0,1] clamp.)
+    out += PrimaryColorExpr();
 
     out += "    texcoord0 = vec2(" + semantic(VSOutputAttributes::TEXCOORD0_U) + ", " +
            semantic(VSOutputAttributes::TEXCOORD0_V) + ");\n";

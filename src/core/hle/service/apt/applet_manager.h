@@ -427,6 +427,14 @@ public:
         return app_jump_parameters;
     }
 
+    /// Restores the jump parameters across a title reset — see
+    /// HackType::PRESERVE_APP_JUMP_PARAMS. Without this a relaunched
+    /// self-jumping title sees Valid() == false and never reads its
+    /// deliver arg.
+    void SetApplicationJumpParameters(const ApplicationJumpParameters& params) {
+        app_jump_parameters = params;
+    }
+
     ResultVal<Service::FS::MediaType> Unknown54(u32 in_param);
     TargetPlatform GetTargetPlatform();
     ApplicationRunningMode GetApplicationRunningMode();

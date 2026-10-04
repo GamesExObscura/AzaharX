@@ -770,6 +770,13 @@ bool RasterizerVulkan::AccelerateDisplay(const Pica::FramebufferConfig& config,
         return false;
     }
 
+    // Restore exact-parameter matching (from before my broad-lookup
+    // experiment). The broad hardcoded 240x320 RGB8 lookup matched
+    // stale surfaces during MFA transitions — Vulkan's res_cache is
+    // populated differently from OpenGL's, so the OpenGL trick
+    // doesn't translate. Strict matching means format/stride changes
+    // (loading RGB8 → gameplay RGBA8) fail correctly and drop us
+    // into the CPU-upload fallback, which reads current 3DS memory.
     VideoCore::SurfaceParams src_params;
     src_params.addr = framebuffer_addr;
     src_params.width = std::min(config.width.Value(), pixel_stride);

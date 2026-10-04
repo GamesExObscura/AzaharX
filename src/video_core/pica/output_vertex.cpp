@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "common/hacks/hack_list.h"
 #include "video_core/pica/output_vertex.h"
 #include "video_core/pica/regs_rasterizer.h"
 
@@ -25,10 +26,22 @@ OutputVertex::OutputVertex(const RasterizerRegs& regs, const AttributeBuffer& ou
     // Copy to result
     std::memcpy(this, vertex_slots_overflow.data(), sizeof(OutputVertex));
 
-    // The hardware takes the absolute and saturates vertex colors, *before* doing interpolation
+    // Stock PICA behavior: take the absolute value and saturate vertex
+    // colors to [0,1] before interpolation. Disney Princess: My Fairytale
+    // Adventure writes overbright vertex colors so a later
+    // `PrimaryColor * Texture0` multiply can saturate from a darker
+    // texture — hard-clamping to 1.0 turns its pink fabric burgundy —
+    // so it gets 2.0 of headroom, title-gated (OVERBRIGHT_VERTEX_COLORS)
+    // because the extra headroom subtly changes colors in any game that
+    // relies on the hardware saturate.
+    const f32 clamp_max =
+        Common::Hacks::g_overbright_vertex_colors.load(std::memory_order_relaxed) ? 2.0f : 1.0f;
     for (u32 i = 0; i < 4; ++i) {
-        const f32 c = std::fabs(color[i].ToFloat32());
-        color[i] = f24::FromFloat32(c < 1.0f ? c : 1.0f);
+        f32 c = std::fabs(color[i].ToFloat32());
+        if (c > clamp_max) {
+            c = clamp_max;
+        }
+        color[i] = f24::FromFloat32(c);
     }
 }
 

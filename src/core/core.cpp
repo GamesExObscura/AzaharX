@@ -9,6 +9,7 @@
 #include "audio_core/hle/hle.h"
 #include "audio_core/lle/lle.h"
 #include "common/arch.h"
+#include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/arm/arm_interface.h"
@@ -407,6 +408,15 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
             apt->GetAppletManager()->SetSysMenuArg(restore_sys_menu_arg.value());
             restore_sys_menu_arg.reset();
         }
+        // See HackType::PRESERVE_APP_JUMP_PARAMS — without this the
+        // deliver arg restored just above stays unreachable, because
+        // GetStartupArgument first checks ApplicationJumpParameters::Valid().
+        if (restore_app_jump_parameters.has_value()) {
+            apt->GetAppletManager()->SetApplicationJumpParameters(
+                restore_app_jump_parameters.value());
+            LOG_INFO(Core, "[APP-JUMP] restored jump params after reset (startup arg now readable)");
+            restore_app_jump_parameters.reset();
+        }
         apt->SetWirelessRebootInfoBuffer(restore_wireless_reboot_info);
     }
 
@@ -544,7 +554,26 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     kernel->SetCPUs(cpu_cores);
     kernel->SetRunningCPU(cpu_cores[0].get());
 
-    const auto audio_emulation = Settings::values.audio_emulation.GetValue();
+    auto audio_emulation = Settings::values.audio_emulation.GetValue();
+
+    // Title-gated DSP LLE — see HackType::FORCE_DSP_LLE. The TT/LEGO
+    // engine's audio is only correct under the real DSP firmware. Read
+    // the program ID here (the loader is already available; the same read
+    // happens a few lines below for the kernel) so the choice can be made
+    // before the DSP core is constructed. Only upgrades HLE -> LLE; an
+    // explicit user LLE/LLEMultithreaded selection is left alone.
+    if (audio_emulation == Settings::AudioEmulation::HLE && app_loader) {
+        u64 dsp_title_id = 0;
+        if (app_loader->ReadProgramId(dsp_title_id) == Loader::ResultStatus::Success) {
+            const auto* dsp_hack = Common::Hacks::hack_manager.GetHack(
+                Common::Hacks::HackType::FORCE_DSP_LLE, dsp_title_id);
+            if (dsp_hack && dsp_hack->mode == Common::Hacks::HackAllowMode::FORCE) {
+                audio_emulation = Settings::AudioEmulation::LLE;
+                LOG_INFO(Core, "[DSP-LLE] forcing LLE audio for program 0x{:016X}", dsp_title_id);
+            }
+        }
+    }
+
     if (audio_emulation == Settings::AudioEmulation::HLE) {
         dsp_core = std::make_unique<AudioCore::DspHle>(*this);
     } else {
@@ -693,6 +722,12 @@ void System::Shutdown(bool is_deserializing) {
     // Shutdown emulation session
     is_powered_on = false;
 
+    // ASYNC_WAKE_SHUTDOWN_GUARD (title-gated): stop in-flight HLE async tasks from waking guest
+    // threads before the services, kernel and timing they would touch are torn down.
+    if (Common::Hacks::g_async_wake_shutdown_guard.load(std::memory_order_relaxed) && kernel) {
+        kernel->DisableAsyncWakes();
+    }
+
     gpu.reset();
     if (!is_deserializing) {
         lle_modules.clear();
@@ -741,6 +776,21 @@ void System::Reset() {
         restore_deliver_arg = apt->GetAppletManager()->ReceiveDeliverArg();
         restore_sys_menu_arg = apt->GetAppletManager()->GetSysMenuArg();
         restore_wireless_reboot_info = apt->GetWirelessRebootInfoBuffer();
+
+        // Title-gated (PRESERVE_APP_JUMP_PARAMS): also carry the jump
+        // parameters over, otherwise the relaunched title's
+        // GetStartupArgument sees Valid() == false and drops the deliver
+        // arg we just saved above — the compilation sub-game-select loop.
+        const auto jump_params = apt->GetAppletManager()->GetApplicationJumpParameters();
+        if (jump_params.Valid()) {
+            const auto* jump_hack = Common::Hacks::hack_manager.GetHack(
+                Common::Hacks::HackType::PRESERVE_APP_JUMP_PARAMS, jump_params.current_title_id);
+            if (jump_hack && jump_hack->mode == Common::Hacks::HackAllowMode::FORCE) {
+                restore_app_jump_parameters = jump_params;
+                LOG_INFO(Core, "[APP-JUMP] preserving jump params across reset (0x{:016X} -> 0x{:016X})",
+                         jump_params.current_title_id, jump_params.next_title_id);
+            }
+        }
     }
     if (auto plg_ldr = Service::PLGLDR::GetService(*this)) {
         restore_plugin_context = plg_ldr->GetPluginLoaderContext();

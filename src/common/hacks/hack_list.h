@@ -390,6 +390,19 @@ enum class HackType : int {
     // When gated, wrap the index into the valid range and perform the
     // write ([ZPICA] log per occurrence).
     FORCE_VALIDATED_PICA_INDEX,
+    // OpenGL only. Luigi's Mansion: Dark Moon freezes up to ~0.9 s when an area
+    // first appears: a batch of ~12 new fragment shaders, each 55-100 ms to link
+    // in the NVIDIA driver. ~70% of that is the per-light lighting code, which the
+    // generator unrolls once per light (8 lights here). When gated, the GLSL
+    // generator emits ONE loop over the enabled lights with each light's
+    // configuration in const arrays (same math, factor 1.0 where a feature is
+    // off) plus "#pragma optionNV(unroll none)": the link drops ~48 -> ~21 ms
+    // in an offline benchmark of a real LM2 shader ([GL-LIGHTLOOP]).
+    // This gate also enables the OpenGL manager's uniform light count/flags and
+    // source deduplication. Light changes then reuse the same shader, and cached
+    // permutations are deduplicated before compilation. The gate is resolved per
+    // shader manager so switching to an applet does not change its behavior.
+    GL_LOOPED_LIGHTING,
 };
 
 // Set at title load (GPU::ReportLoadingProgramID) when the
@@ -501,6 +514,9 @@ extern std::atomic<bool> g_ignore_format_reinterpretation;
 
 // Set at title load; read by PicaCore::WriteInternalReg indexed paths.
 extern std::atomic<bool> g_force_validated_pica_index;
+
+// Set at title load; read by the GLSL fragment shader generator (OpenGL profile only).
+extern std::atomic<bool> g_gl_looped_lighting;
 
 class UserHackData {};
 

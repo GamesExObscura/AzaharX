@@ -78,6 +78,7 @@ struct Values {
 
     Settings::Setting<bool> single_window_mode{true, "singleWindowMode"};
     Settings::Setting<bool> fullscreen{false, "fullscreen"};
+    Settings::Setting<bool> wiiu_3ds_link_enabled{false, "wiiu_3ds_link_enabled"};
     Settings::Setting<bool> display_titlebar{true, "displayTitleBars"};
     Settings::Setting<bool> show_filter_bar{true, "showFilterBar"};
     Settings::Setting<bool> show_status_bar{true, "showStatusBar"};

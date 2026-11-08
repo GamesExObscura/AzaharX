@@ -51,6 +51,7 @@ enum class ResultStatus {
     SendError_BadNode,
     SendError_BadMacAddress,
     SendError_PacketSizeTooLarge,
+    SendError_TransportBusy,
     RecvError_NotConnected,
     RecvError_BadNode,
     RecvError_PacketSizeTooLarge,
@@ -162,6 +163,14 @@ public:
 
 private:
     Core::System& system;
+    bool SendPacket(Network::WifiPacket& packet);
+    void PollPrivateLink(std::uintptr_t user_data, s64 cycles_late);
+    void DisconnectPrivateLink();
+    std::atomic<bool> private_link_mode{false};
+    bool private_link_had_peer{};
+    u64 private_link_received{}, private_link_sent{};
+    Core::TimingEventType* private_link_poll_event{};
+    std::string private_link_status;
 
     void UpdateNetworkAttribute(Kernel::HLERequestContext& ctx);
 

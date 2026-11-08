@@ -48,7 +48,7 @@ private:
     static constexpr std::size_t SOURCE_FILE_HASH_LENGTH = 64;
     using SourceFileCacheVersionHash = std::array<u8, SOURCE_FILE_HASH_LENGTH>;
 
-    static SourceFileCacheVersionHash GetSourceFileCacheVersionHash();
+    static SourceFileCacheVersionHash GetSourceFileCacheVersionHash(u64 program_id);
 
     enum class CacheFileType : u32 {
         VS_CACHE = 0,

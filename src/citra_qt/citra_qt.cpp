@@ -2,10 +2,12 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <array>
 #include <clocale>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <QFileDialog>
@@ -20,6 +22,8 @@
 #include <QtGui>
 #include <QtWidgets>
 #include <boost/algorithm/string/replace.hpp>
+#include "Transport.h"
+#include "citra_qt/direct_link_dialog.h"
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #ifdef __APPLE__
@@ -80,6 +84,7 @@
 #include "citra_qt/uisettings.h"
 #include "common/play_time_manager.h"
 #ifdef ENABLE_QT_UPDATE_CHECKER
+#include "citra_qt/azaharx_version.h"
 #include "citra_qt/update_checker.h"
 #endif
 #include "citra_qt/util/clickable_label.h"
@@ -248,13 +253,40 @@ static bool ShouldCheckForPrereleaseUpdates() {
     return (IsPrereleaseBuild() || using_prerelease_channel);
 }
 
-static int GetMajorVersion(const std::string& version) {
-    size_t dot = version.find('.');
-    try {
-        return std::stoi(version.substr(0, dot));
-    } catch (...) {
-        return 0;
+// "v1.2.3" -> {1, 2, 3}. Missing parts count as 0 and anything after the numbers (such as
+// "-rc1") is ignored. nullopt if the tag doesn't start with a number.
+static std::optional<std::array<int, 3>> ParseVersion(std::string_view tag) {
+    if (!tag.empty() && (tag.front() == 'v' || tag.front() == 'V')) {
+        tag.remove_prefix(1);
     }
+    std::array<int, 3> parts{};
+    std::size_t part = 0;
+    bool have_digit = false;
+    for (const char c : tag) {
+        if (c >= '0' && c <= '9') {
+            if (parts[part] > 99999) {
+                return std::nullopt;
+            }
+            parts[part] = parts[part] * 10 + (c - '0');
+            have_digit = true;
+        } else if (c == '.' && have_digit && part + 1 < parts.size()) {
+            ++part;
+            have_digit = false;
+        } else {
+            break;
+        }
+    }
+    if (part == 0 && !have_digit) {
+        return std::nullopt;
+    }
+    return parts;
+}
+
+// True only when the release tag is a higher version than this build's AZAHARX_VERSION.
+static bool IsNewerRelease(const std::string& latest_tag) {
+    const auto latest = ParseVersion(latest_tag);
+    const auto current = ParseVersion(AZAHARX_VERSION);
+    return latest && current && *latest > *current;
 }
 #endif
 
@@ -504,17 +536,15 @@ GMainWindow::GMainWindow(Core::System& system_)
 #endif
 
 #ifdef ENABLE_QT_UPDATE_CHECKER
-    if (UISettings::values.check_for_update_on_start) {
+    // A game passed on the command line (front ends such as LaunchBox) skips the startup
+    // check, so the prompt never lands on top of a game.
+    if (UISettings::values.check_for_update_on_start && game_path.isEmpty()) {
         update_future = QtConcurrent::run([]() -> QString {
             const std::optional<std::string> latest_release_tag =
                 UpdateChecker::GetLatestRelease(ShouldCheckForPrereleaseUpdates());
 
-            if (latest_release_tag && latest_release_tag.value() != Common::g_build_fullname) {
-                const int latest_major_version = GetMajorVersion(latest_release_tag.value());
-                const int current_major_version = GetMajorVersion(Common::g_build_fullname);
-                if (current_major_version <= latest_major_version) {
-                    return QString::fromStdString(latest_release_tag.value());
-                }
+            if (latest_release_tag && IsNewerRelease(latest_release_tag.value())) {
+                return QString::fromStdString(latest_release_tag.value());
             }
             return QString{};
         });
@@ -522,6 +552,8 @@ GMainWindow::GMainWindow(Core::System& system_)
                          &GMainWindow::OnEmulatorUpdateAvailable);
         update_watcher.setFuture(update_future);
     }
+    QObject::connect(&manual_update_watcher, &QFutureWatcher<QString>::finished, this,
+                     &GMainWindow::OnManualUpdateCheckFinished);
 #endif
 
     mouse_hide_timer.setInterval(default_mouse_timeout);
@@ -1038,7 +1070,9 @@ void GMainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
     if (!emulation_running) {
         return;
     }
-    if (UISettings::values.pause_when_in_background) {
+    // The native link must keep supplying inputs while a TV stream viewer has focus.
+    if (UISettings::values.pause_when_in_background &&
+        !WiiU3DSLink::GetTransport().GetStatus().enabled) {
         if (emu_thread->IsRunning() &&
             (state & (Qt::ApplicationHidden | Qt::ApplicationInactive))) {
             auto_paused = true;
@@ -1118,6 +1152,63 @@ void GMainWindow::ConnectWidgetEvents() {
 }
 
 void GMainWindow::ConnectMenuEvents() {
+    auto* link_menu = ui->menu_Tools->addMenu(tr("Wii U/3DS Link"));
+    auto* enable_link = link_menu->addAction(tr("Enable Wii U/3DS link (experimental)"));
+    enable_link->setCheckable(true);
+    auto& transport = WiiU3DSLink::GetTransport();
+    if (UISettings::values.wiiu_3ds_link_enabled.GetValue())
+        transport.Start(WiiU3DSLink::Role::Nintendo3DS, 44661, 44660);
+    enable_link->setChecked(transport.GetStatus().enabled);
+    connect(enable_link, &QAction::triggered, this, [this, enable_link](bool enabled) {
+        auto& link = WiiU3DSLink::GetTransport();
+        if (emulation_running) {
+            enable_link->setChecked(link.GetStatus().enabled);
+            QMessageBox::warning(this, tr("Wii U/3DS Link"), tr("Stop the game before changing its local-wireless backend."));
+            return;
+        }
+        if (enabled) {
+            const auto member = Network::GetRoomMember().lock();
+            const auto room = Network::GetRoom().lock();
+            if ((member && (member->IsConnected() || member->GetState() == Network::RoomMember::State::Joining)) ||
+                (room && room->GetState() == Network::Room::State::Open)) {
+                enable_link->setChecked(false);
+                QMessageBox::warning(this, tr("Wii U/3DS Link"), tr("Leave the multiplayer room before enabling the Wii U link. The room connection and settings have not been changed."));
+                return;
+            }
+        }
+        const bool requested = enabled;
+        if (enabled) enabled = link.Start(WiiU3DSLink::Role::Nintendo3DS, 44661, 44660);
+        else link.Stop();
+        UISettings::values.wiiu_3ds_link_enabled = enabled;
+        config->Save();
+        enable_link->setChecked(enabled);
+        if (requested && !enabled)
+            QMessageBox::warning(this, tr("Wii U/3DS Link"), QString::fromStdString(WiiU3DSLink::DescribeStatus(link.GetStatus())));
+    });
+    auto* link_status = link_menu->addAction(tr("Status..."));
+    auto* direct_link = link_menu->addAction(tr("Join LAN/Internet with passphrase..."));
+    connect(direct_link, &QAction::triggered, this, [this, enable_link] {
+        if (emulation_running) {
+            QMessageBox::warning(this, tr("Wii U/3DS Link"), tr("Stop the game before configuring the direct link."));
+            return;
+        }
+        const auto member = Network::GetRoomMember().lock();
+        const auto room = Network::GetRoom().lock();
+        if ((member && (member->IsConnected() || member->GetState() == Network::RoomMember::State::Joining)) ||
+            (room && room->GetState() == Network::Room::State::Open)) {
+            QMessageBox::warning(this, tr("Wii U/3DS Link"), tr("Leave the multiplayer room before joining the Wii U link. Your room and account settings have not been changed."));
+            return;
+        }
+        if (ConfigureDirectLink(this)) {
+            UISettings::values.wiiu_3ds_link_enabled = false;
+            config->Save();
+        }
+        enable_link->setChecked(WiiU3DSLink::GetTransport().GetStatus().enabled);
+    });
+    connect(link_status, &QAction::triggered, this, [this] {
+        QMessageBox::information(this, tr("Wii U/3DS Link"),
+            QString::fromStdString(WiiU3DSLink::DescribeStatus(WiiU3DSLink::GetTransport().GetStatus())));
+    });
     const auto connect_menu = [&](QAction* action, const auto& event_fn,
                                   QAction::MenuRole role = QAction::NoRole) {
         action->setMenuRole(role);
@@ -1240,6 +1331,11 @@ void GMainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_FAQ, []() {
         QDesktopServices::openUrl(QUrl(QStringLiteral("https://azahar-emu.org/pages/faq/")));
     });
+#ifdef ENABLE_QT_UPDATE_CHECKER
+    connect_menu(ui->action_Check_For_Updates, &GMainWindow::OnCheckForUpdates);
+#else
+    ui->action_Check_For_Updates->setVisible(false);
+#endif
     connect_menu(ui->action_About, &GMainWindow::OnMenuAboutCitra, QAction::AboutRole);
 }
 
@@ -4231,26 +4327,60 @@ void GMainWindow::OnMoviePlaybackCompleted() {
 
 #ifdef ENABLE_QT_UPDATE_CHECKER
 void GMainWindow::OnEmulatorUpdateAvailable() {
-    QString version_string = update_future.result();
-    if (version_string.isEmpty())
+    const QString latest_tag = update_future.result();
+    // Never interrupt a running game; the next start checks again.
+    if (latest_tag.isEmpty() || emulation_running) {
         return;
+    }
+    ShowUpdatePrompt(latest_tag);
+}
 
+void GMainWindow::OnCheckForUpdates() {
+    if (manual_update_watcher.isRunning()) {
+        return;
+    }
+    ui->action_Check_For_Updates->setEnabled(false);
+    manual_update_future = QtConcurrent::run([]() -> QString {
+        const std::optional<std::string> latest_release_tag =
+            UpdateChecker::GetLatestRelease(ShouldCheckForPrereleaseUpdates());
+        return latest_release_tag ? QString::fromStdString(latest_release_tag.value())
+                                  : QString{};
+    });
+    manual_update_watcher.setFuture(manual_update_future);
+}
+
+void GMainWindow::OnManualUpdateCheckFinished() {
+    ui->action_Check_For_Updates->setEnabled(true);
+    const QString latest_tag = manual_update_future.result();
+    if (latest_tag.isEmpty()) {
+        QMessageBox::warning(this, tr("Check for Updates"),
+                             tr("Couldn't reach GitHub to check for updates.\n"
+                                "Check your internet connection and try again."));
+    } else if (IsNewerRelease(latest_tag.toStdString())) {
+        ShowUpdatePrompt(latest_tag);
+    } else {
+        QMessageBox::information(this, tr("Check for Updates"),
+                                 tr("You have the latest version of AzaharX (v%1).")
+                                     .arg(QString::fromLatin1(AZAHARX_VERSION)));
+    }
+}
+
+void GMainWindow::ShowUpdatePrompt(const QString& latest_tag) {
     QMessageBox update_prompt(this);
     update_prompt.setWindowTitle(tr("Update Available"));
     update_prompt.setIcon(QMessageBox::Information);
-    update_prompt.addButton(QMessageBox::Yes);
-    update_prompt.addButton(QMessageBox::Ignore);
-    update_prompt.setText(tr("Update %1 for Azahar is available.\nWould you like to download it?")
-                              .arg(version_string));
-    update_prompt.exec();
-    if (update_prompt.button(QMessageBox::Yes) == update_prompt.clickedButton()) {
-        std::string update_page_url;
-        if (ShouldCheckForPrereleaseUpdates()) {
-            update_page_url = "https://github.com/azahar-emu/azahar/releases";
-        } else {
-            update_page_url = "https://azahar-emu.org/pages/download/";
-        }
-        QDesktopServices::openUrl(QUrl(QString::fromStdString(update_page_url)));
+    update_prompt.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    update_prompt.setTextFormat(Qt::PlainText);
+    update_prompt.setText(
+        tr("You have AzaharX v%1.\nAzaharX %2 is available.\n\nOpen the download page?")
+            .arg(QString::fromLatin1(AZAHARX_VERSION), latest_tag));
+    if (update_prompt.exec() == QMessageBox::Yes) {
+        // A fixed address, never one taken from the GitHub reply.
+        const QString update_page_url =
+            ShouldCheckForPrereleaseUpdates()
+                ? QStringLiteral("https://github.com/GamesExObscura/AzaharX/releases")
+                : QStringLiteral("https://github.com/GamesExObscura/AzaharX/releases/latest");
+        QDesktopServices::openUrl(QUrl(update_page_url));
     }
 }
 #endif

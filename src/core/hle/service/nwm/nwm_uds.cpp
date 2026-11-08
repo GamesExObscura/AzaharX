@@ -26,6 +26,9 @@
 #include "core/hle/service/nwm/uds_connection.h"
 #include "core/hle/service/nwm/uds_data.h"
 #include "core/memory.h"
+#include "Transport.h"
+#include "NativeFrames.h"
+#include "core/hle/service/nwm/uds_link_channel.h"
 
 SERIALIZE_EXPORT_IMPL(Service::NWM::NWM_UDS)
 SERVICE_CONSTRUCT_IMPL(Service::NWM::NWM_UDS)
@@ -78,15 +81,96 @@ std::list<Network::WifiPacket> NWM_UDS::GetReceivedBeacons(const MacAddress& sen
 }
 
 /// Sends a WifiPacket to the room we're currently connected to.
-void SendPacket(Network::WifiPacket& packet) {
+bool NWM_UDS::SendPacket(Network::WifiPacket& packet) {
+    if (private_link_mode) {
+        if (packet.type == Network::WifiPacket::PacketType::NodeMap) return false;
+        packet.transmitter_address=GetMacAddress();
+        if (packet.type==Network::WifiPacket::PacketType::Deauthentication && packet.data.empty())
+            packet.data={3,0};
+        WiiU3DSLink::Frame frame{static_cast<WiiU3DSLink::FrameType>(packet.type),packet.channel,
+                                 packet.transmitter_address,packet.destination_address,packet.data};
+        if (WiiU3DSLink::ValidateNativeFrame(frame)!=WiiU3DSLink::NativeFrameError::None)
+            return false;
+        const bool sent=WiiU3DSLink::GetTransport().Send(frame);
+        if (sent) ++private_link_sent;
+        return sent;
+    }
     if (auto room_member = Network::GetRoomMember().lock()) {
         if (room_member->GetState() == Network::RoomMember::State::Joined ||
             room_member->GetState() == Network::RoomMember::State::Moderator) {
 
             packet.transmitter_address = room_member->GetMacAddress();
             room_member->SendWifiPacket(packet);
+            return true;
         }
     }
+    return false;
+}
+
+void NWM_UDS::DisconnectPrivateLink() {
+    std::scoped_lock lock{connection_status_mutex,system.Kernel().GetHLELock()};
+    const auto changed=connection_status.node_bitmask;
+    connection_status={};
+    connection_status.status=NetworkStatus::NotConnected;
+    connection_status.status_change_reason=NetworkStatusChangeReason::ConnectionLost;
+    connection_status.changed_nodes=changed;
+    node_map.clear();
+    node_info.clear();
+    for(auto& [channel,data]:channel_data) {data.received_packets.clear(); data.event->Signal();}
+    connection_status_event->Signal();
+    if(connection_event) connection_event->Signal();
+}
+
+void NWM_UDS::PollPrivateLink(std::uintptr_t, s64 cycles_late) {
+    using namespace WiiU3DSLink;
+    if(!initialized || !private_link_mode) return;
+    auto& transport=GetTransport();
+    const auto link=transport.GetStatus();
+    if(!link.enabled || (private_link_had_peer && !link.peer_present)) DisconnectPrivateLink();
+    private_link_had_peer=link.peer_present;
+    if(!link.enabled) return;
+    for(unsigned i=0;i<128;++i) {
+        auto frame=transport.Receive();
+        if(!frame) break;
+        const auto own_mac=GetMacAddress();
+        if(frame->source==own_mac || (frame->source[0]&1) ||
+            (frame->destination!=own_mac && frame->destination!=Network::BroadcastMac) ||
+            ValidateNativeFrame(*frame)!=NativeFrameError::None) continue;
+        if(frame->type!=FrameType::Beacon &&
+            (frame->source!=network_info.host_mac_address || frame->channel!=network_channel)) continue;
+        if(frame->type==FrameType::Authentication && NativeFrameDetail::LE16(frame->data,2)!=2) continue;
+        if(frame->type==FrameType::AssociationResponse) {
+            if(connection_status.status!=NetworkStatus::Connecting) continue;
+            const auto expected=fmt::format("{:08X}",static_cast<u32>(network_info.network_id));
+            bool network_matches=false;
+            for(std::size_t offset=6; offset+2<=frame->data.size();) {
+                const auto size=frame->data[offset+1];
+                if(frame->data[offset]==0 && size==8 &&
+                    std::equal(expected.begin(),expected.end(),frame->data.begin()+offset+2)) network_matches=true;
+                offset+=2+size;
+            }
+            if(!network_matches) continue;
+        }
+        if(frame->type==FrameType::Data && NativeFrameDetail::BE16(frame->data,6)==0x888E) {
+            if(NativeFrameDetail::BE16(frame->data,8)!=0x202 ||
+                ValidateNativeFrame(*frame,network_info.max_nodes)!=NativeFrameError::None ||
+                !std::equal(own_mac.begin(),own_mac.end(),frame->data.begin()+14)) continue;
+        }
+        if(frame->type==FrameType::Deauthentication) {DisconnectPrivateLink(); continue;}
+        Network::WifiPacket packet;
+        packet.type=static_cast<Network::WifiPacket::PacketType>(frame->type);
+        packet.channel=frame->channel; packet.transmitter_address=frame->source;
+        packet.destination_address=frame->destination; packet.data=std::move(frame->data);
+        OnWifiPacketReceived(packet);
+        ++private_link_received;
+    }
+    auto status=fmt::format("3DS native UDS state {}; node {}; wire packets received {} / sent {}",
+        static_cast<u32>(connection_status.status),static_cast<u16>(connection_status.network_node_id),
+        private_link_received,private_link_sent);
+    if(status!=private_link_status) {
+        private_link_status=status; transport.SetGuestStatus(std::move(status));
+    }
+    system.CoreTiming().ScheduleEvent(std::max<s64>(1,static_cast<s64>(msToCycles(4))-cycles_late),private_link_poll_event,0);
 }
 
 u16 NWM_UDS::GetNextAvailableNodeId() {
@@ -405,6 +489,8 @@ void NWM_UDS::HandleSecureDataPacket(const Network::WifiPacket& packet) {
         return;
     }
 
+    if (private_link_mode && channel_info->second.received_packets.size()>=128) return;
+
     // Add the received packet to the data queue.
     channel_info->second.received_packets.emplace_back(packet.data);
 
@@ -597,6 +683,17 @@ boost::optional<Network::MacAddress> NWM_UDS::GetNodeMacAddress(u16 dest_node_id
 }
 
 void NWM_UDS::ShutdownHLE() {
+    if (private_link_mode) {
+        if(connection_status.status==NetworkStatus::ConnectedAsClient || connection_status.status==NetworkStatus::Connecting) {
+            Network::WifiPacket packet;
+            packet.type=Network::WifiPacket::PacketType::Deauthentication;
+            packet.channel=network_channel; packet.destination_address=network_info.host_mac_address;
+            packet.data={3,0}; SendPacket(packet);
+        }
+        system.CoreTiming().UnscheduleEvent(private_link_poll_event,0);
+        WiiU3DSLink::GetTransport().SetGuestStatus("3DS native UDS shut down.");
+        private_link_mode=false;
+    }
     initialized = false;
 
     for (auto& bind_node : channel_data) {
@@ -696,6 +793,22 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
     u32 sharedmem_size, const NodeInfo& node, u16 version,
     std::shared_ptr<Kernel::SharedMemory> sharedmem) {
 
+    const bool requested_link=WiiU3DSLink::GetTransport().GetStatus().enabled;
+    if(requested_link) {
+        if(auto room=Network::GetRoomMember().lock(); room && room->IsConnected())
+            return Result(ErrorDescription::AlreadyInitialized,ErrorModule::UDS,ErrorSummary::OutOfResource,ErrorLevel::Status);
+    }
+    system.CoreTiming().UnscheduleEvent(private_link_poll_event,0);
+    private_link_mode=requested_link;
+    private_link_had_peer=false;
+    private_link_received=private_link_sent=0;
+    private_link_status.clear();
+    if(private_link_mode) {
+        while(WiiU3DSLink::GetTransport().Receive()) {}
+        {std::scoped_lock lock(beacon_mutex); received_beacons.clear();}
+        system.CoreTiming().ScheduleEvent(msToCycles(4),private_link_poll_event,0);
+        LOG_INFO(Service_NWM,"Native Wii U/3DS link initialized (private loopback)");
+    }
     current_node = node;
     initialized = true;
 
@@ -1167,6 +1280,9 @@ void NWM_UDS::SendTo(Kernel::HLERequestContext& ctx) {
     auto res = SendToHLE(dest_node_id, data_channel, data_size, flags, input_buffer);
 
     switch (res) {
+    case ResultStatus::SendError_TransportBusy:
+        rb.Push(Result(ErrorDescription::Busy,ErrorModule::UDS,ErrorSummary::OutOfResource,ErrorLevel::Status));
+        return;
     case ResultStatus::SendError_PacketSizeTooLarge:
         rb.Push(Result(ErrorDescription::TooLarge, ErrorModule::UDS, ErrorSummary::WrongArgument,
                        ErrorLevel::Usage));
@@ -1243,9 +1359,8 @@ ResultStatus NWM_UDS::SendToHLE(u32 dest_node_id, u8 data_channel, u32 data_size
     packet.data = std::move(data_payload);
     packet.type = Network::WifiPacket::PacketType::Data;
 
-    SendPacket(packet);
-
-    return ResultStatus::ResultSuccess;
+    const bool sent=SendPacket(packet);
+    return private_link_mode && !sent ? ResultStatus::SendError_TransportBusy : ResultStatus::ResultSuccess;
 }
 
 void NWM_UDS::PullPacket(Kernel::HLERequestContext& ctx) {
@@ -1256,12 +1371,13 @@ void NWM_UDS::PullPacket(Kernel::HLERequestContext& ctx) {
     u32 max_out_buff_size = rp.Pop<u32>();
     std::vector<u8> output_buffer;
 
-    SecureDataHeader secure_data;
+    SecureDataHeader secure_data{};
 
     auto ret = PullPacketHLE(bind_node_id, max_out_buff_size, max_out_buff_size_aligned,
                              output_buffer, &secure_data);
 
-    switch (ret.error()) {
+    // A successful Expected contains a byte count, not an error code.
+    switch (ret ? ResultStatus::ResultSuccess : ret.error()) {
     case ResultStatus::RecvError_NotConnected: {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
         rb.Push(Result(ErrorDescription::NotAuthorized, ErrorModule::UDS,
@@ -1391,6 +1507,12 @@ private:
 void NWM_UDS::ConnectToNetworkHLE(NetworkInfo net_info, u8 connection_type,
                                   std::vector<u8> passphrase) {
     network_info = net_info;
+
+    if (private_link_mode) {
+        network_channel = LinkClientChannel(net_info.channel, network_channel);
+        LOG_INFO(Service_NWM, "Private UDS join: discovered channel {}, active channel {}",
+                 net_info.channel, network_channel);
+    }
 
     conn_type = static_cast<ConnectionType>(connection_type);
 
@@ -1546,10 +1668,32 @@ void NWM_UDS::DecryptBeaconData(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
     const std::vector<u8> network_struct_buffer = rp.PopStaticBuffer();
-    ASSERT(network_struct_buffer.size() == sizeof(NetworkInfo));
 
     const std::vector<u8> encrypted_data0_buffer = rp.PopStaticBuffer();
     const std::vector<u8> encrypted_data1_buffer = rp.PopStaticBuffer();
+
+    if (private_link_mode) {
+        NetworkInfo info{};
+        NodeList decoded;
+        bool valid = network_struct_buffer.size() == sizeof(info);
+        if (valid) {
+            std::memcpy(&info, network_struct_buffer.data(), sizeof(info));
+            valid = DecryptPrivateLinkBeacon(info, encrypted_data0_buffer, encrypted_data1_buffer, decoded);
+        }
+        if (!valid) {
+            IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+            rb.Push(Result(static_cast<ErrorDescription>(5), ErrorModule::UDS,
+                           ErrorSummary::Canceled, ErrorLevel::Usage));
+            return;
+        }
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ResultSuccess);
+        std::vector<u8> output(sizeof(NodeInfo) * UDSMaxNodes);
+        std::memcpy(output.data(), decoded.data(), decoded.size() * sizeof(NodeInfo));
+        rb.PushStaticBuffer(std::move(output), 0);
+        return;
+    }
+    ASSERT(network_struct_buffer.size() == sizeof(NetworkInfo));
 
     LOG_DEBUG(Service_NWM, "called");
 
@@ -1642,6 +1786,7 @@ void NWM_UDS::BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late)
 }
 
 Network::MacAddress NWM_UDS::GetMacAddress() {
+    if(private_link_mode) return CFG::GetConsoleMacAddress(system);
     MacAddress mac;
 
     if (auto room_member = Network::GetRoomMember().lock();
@@ -1703,18 +1848,21 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
         "UDS::BeaconBroadcastCallback", [this](std::uintptr_t user_data, s64 cycles_late) {
             BeaconBroadcastCallback(user_data, cycles_late);
         });
+    private_link_poll_event=system.CoreTiming().RegisterEvent("UDS::PrivateWiiULink",
+        [this](std::uintptr_t user_data,s64 cycles_late){PollPrivateLink(user_data,cycles_late);});
 
     system.Kernel().GetSharedPageHandler().SetMacAddress(GetMacAddress());
 
     if (auto room_member = Network::GetRoomMember().lock()) {
         wifi_packet_received = room_member->BindOnWifiPacketReceived(
-            [this](const Network::WifiPacket& packet) { OnWifiPacketReceived(packet); });
+            [this](const Network::WifiPacket& packet) { if(!private_link_mode) OnWifiPacketReceived(packet); });
     } else {
         LOG_ERROR(Service_NWM, "Network isn't initalized");
     }
 }
 
 NWM_UDS::~NWM_UDS() {
+    system.CoreTiming().UnscheduleEvent(private_link_poll_event,0);
     if (auto room_member = Network::GetRoomMember().lock())
         room_member->Unbind(wifi_packet_received);
 

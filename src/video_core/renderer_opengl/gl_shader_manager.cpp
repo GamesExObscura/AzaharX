@@ -3,12 +3,17 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <mutex>
 #include <set>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
+#include "common/hacks/hack_manager.h"
 #include "common/hash.h"
 #include "common/settings.h"
 #include "core/frontend/emu_window.h"
@@ -158,32 +163,72 @@ public:
     explicit ShaderCache(bool separable_) : separable{separable_} {}
     ~ShaderCache() = default;
 
+    void DeduplicateSources(bool enabled) {
+        deduplicate_sources = enabled;
+    }
+
     template <typename... Args>
     std::tuple<u64, GLuint, std::optional<std::string>> Get(const KeyConfigType& config,
                                                             Args&&... args) {
-        auto [iter, new_shader] = shaders.emplace(config.Hash(), OGLShaderStage{separable});
+        const u64 config_hash = config.Hash();
+        if (deduplicate_sources) {
+            const auto alias = shader_aliases.find(config_hash);
+            if (alias != shader_aliases.end()) {
+                return {config_hash, alias->second, std::nullopt};
+            }
+        }
+        auto [iter, new_shader] = shaders.emplace(config_hash, OGLShaderStage{separable});
         OGLShaderStage& cached_shader = iter->second;
         std::optional<std::string> result{};
         if (new_shader) {
             result = CodeGenerator(config, args...);
+            if (deduplicate_sources) {
+                const u64 source_hash = Common::ComputeHash64(result->data(), result->size());
+                const auto duplicate = source_programs.find(source_hash);
+                if (duplicate != source_programs.end()) {
+                    const GLuint handle = duplicate->second;
+                    shader_aliases.emplace(config_hash, handle);
+                    shaders.erase(iter);
+                    return {config_hash, handle, std::nullopt};
+                }
+            }
             cached_shader.Create(result->c_str(), ShaderType);
+        }
+        if (deduplicate_sources && result) {
+            source_programs.emplace(Common::ComputeHash64(result->data(), result->size()),
+                                    cached_shader.GetHandle());
         }
         return {iter->first, cached_shader.GetHandle(), std::move(result)};
     }
 
-    void Inject(const KeyConfigType& key, OGLProgram&& program) {
+    GLuint Inject(const KeyConfigType& key, OGLProgram&& program, std::string_view code = {}) {
         OGLShaderStage stage{separable};
         stage.Inject(std::move(program));
-        shaders.emplace(key.Hash(), std::move(stage));
+        return Inject(key, std::move(stage), code);
     }
 
-    void Inject(const KeyConfigType& key, OGLShaderStage&& stage) {
-        shaders.emplace(key.Hash(), std::move(stage));
+    GLuint Inject(const KeyConfigType& key, OGLShaderStage&& stage, std::string_view code = {}) {
+        const u64 config_hash = key.Hash();
+        if (deduplicate_sources && !code.empty()) {
+            const u64 source_hash = Common::ComputeHash64(code.data(), code.size());
+            const auto duplicate = source_programs.find(source_hash);
+            if (duplicate != source_programs.end()) {
+                shader_aliases.emplace(config_hash, duplicate->second);
+                return duplicate->second;
+            }
+            const auto iter = shaders.emplace(config_hash, std::move(stage)).first;
+            source_programs.emplace(source_hash, iter->second.GetHandle());
+            return iter->second.GetHandle();
+        }
+        return shaders.emplace(config_hash, std::move(stage)).first->second.GetHandle();
     }
 
 private:
     bool separable;
+    bool deduplicate_sources{};
     std::unordered_map<u64, OGLShaderStage> shaders;
+    std::unordered_map<u64, GLuint> source_programs;
+    std::unordered_map<u64, GLuint> shader_aliases;
 };
 
 // This is a cache designed for shaders translated from PICA shaders. The first cache matches the
@@ -265,6 +310,22 @@ public:
         : separable(separable), programmable_vertex_shaders(separable),
           trivial_vertex_shader(driver, separable), fixed_geometry_shaders(separable),
           fragment_shaders(separable), disk_cache(title_id, separable) {
+        // Use the existing LM2-only allowlist, resolved for this shader manager's title.
+        // Applets and subsequent games keep independent caches and generator settings.
+        const bool lm2_gate =
+            Common::Hacks::hack_manager.GetHackAllowMode(
+                Common::Hacks::HackType::GL_LOOPED_LIGHTING, title_id,
+                Common::Hacks::HackAllowMode::DISALLOW) == Common::Hacks::HackAllowMode::FORCE;
+        // Diagnostic A/B overrides must not load or overwrite binaries made in the
+        // other mode. IsUsable stays false when LoadTransferable is not called.
+        skip_disk_cache = lm2_gate && (std::getenv("AZ_LM2_DYNAMIC_LIGHTING_OFF") != nullptr ||
+                                       std::getenv("AZ_LIGHTLOOP_OFF") != nullptr);
+        dynamic_lighting = lm2_gate && !skip_disk_cache;
+        fragment_shaders.DeduplicateSources(dynamic_lighting);
+        if (dynamic_lighting) {
+            LOG_INFO(Render_OpenGL, "[GL-LM2-DYNAMIC] uniform lighting enabled for {:016X}",
+                     title_id);
+        }
         if (separable) {
             pipeline.Create();
         }
@@ -314,6 +375,42 @@ public:
     static_assert(offsetof(ShaderTuple, vs_hash) == 0, "ShaderTuple layout changed!");
     static_assert(offsetof(ShaderTuple, fs_hash) == sizeof(std::size_t) * 2,
                   "ShaderTuple layout changed!");
+
+    // Keep the original packed Light config out of shader keys; upload it at draw time.
+    using LightingUniforms = std::array<GLuint, 9 * 4>;
+    bool skip_disk_cache{};
+    bool dynamic_lighting{};
+    bool current_dynamic_lighting{};
+    LightingUniforms lighting_uniforms{};
+    struct UploadedLighting {
+        GLint location{-1};
+        LightingUniforms values{};
+    };
+    std::unordered_map<GLuint, UploadedLighting> uploaded_lighting;
+
+    FSConfig MakeFragmentConfig(const Pica::RegsInternal& regs) const {
+        FSConfig config{regs};
+        if (dynamic_lighting && config.lighting.enable) {
+            config.lighting.src_num.Assign(8);
+            config.lighting.lights.fill({});
+        }
+        return config;
+    }
+
+    void UploadLighting(GLuint program) {
+        if (!current_dynamic_lighting) {
+            return;
+        }
+        auto [it, inserted] = uploaded_lighting.try_emplace(program);
+        if (inserted) {
+            // The driver may optimize lighting away when TEV never reads it.
+            it->second.location = glGetUniformLocation(program, "lm_lighting[0]");
+        }
+        if (it->second.location >= 0 && (inserted || it->second.values != lighting_uniforms)) {
+            glProgramUniform4uiv(program, it->second.location, 9, lighting_uniforms.data());
+            it->second.values = lighting_uniforms;
+        }
+    }
 
     bool separable;
     Pica::Shader::Profile profile{};
@@ -408,8 +505,21 @@ void ShaderProgramManager::UseTrivialGeometryShader() {
 
 void ShaderProgramManager::UseFragmentShader(const Pica::RegsInternal& regs,
                                              const Pica::Shader::UserConfig& user) {
-    const FSConfig fs_config{regs};
-    auto [hash, handle, result] = impl->fragment_shaders.Get(fs_config, user, impl->profile);
+    const FSConfig fs_config = impl->MakeFragmentConfig(regs);
+    impl->current_dynamic_lighting = impl->dynamic_lighting && fs_config.lighting.enable;
+    if (impl->current_dynamic_lighting) {
+        const Pica::Shader::LightConfig lighting{regs.lighting};
+        impl->lighting_uniforms.fill(0);
+        impl->lighting_uniforms[0] = lighting.src_num;
+        for (u32 i = 0; i < lighting.src_num; ++i) {
+            const auto& light = lighting.lights[i];
+            impl->lighting_uniforms[(i + 1) * 4] = light.raw;
+            impl->lighting_uniforms[(i + 1) * 4 + 1] =
+                lighting.lights[light.num.Value()].two_sided_diffuse;
+        }
+    }
+    auto [hash, handle, result] =
+        impl->fragment_shaders.Get(fs_config, user, impl->profile, impl->dynamic_lighting);
     impl->current.fs = handle;
     impl->current.fs_hash = hash;
     // Save FS to the disk cache if its a new shader
@@ -433,6 +543,7 @@ void ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul) {
         glUseProgramStages(impl->pipeline.handle, GL_VERTEX_SHADER_BIT, impl->current.vs);
         glUseProgramStages(impl->pipeline.handle, GL_GEOMETRY_SHADER_BIT, impl->current.gs);
         glUseProgramStages(impl->pipeline.handle, GL_FRAGMENT_SHADER_BIT, impl->current.fs);
+        impl->UploadLighting(impl->current.fs);
         state.draw.shader_program = 0;
         state.draw.program_pipeline = impl->pipeline.handle;
     } else {
@@ -444,6 +555,7 @@ void ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul) {
             auto& disk_cache = impl->disk_cache;
             disk_cache.SaveDumpToFile(unique_identifier, cached_program.handle, accurate_mul);
         }
+        impl->UploadLighting(cached_program.handle);
         state.draw.shader_program = cached_program.handle;
     }
 }
@@ -455,12 +567,31 @@ u64 ShaderProgramManager::GetProgramID() const {
 void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
                                          const VideoCore::DiskResourceLoadCallback& callback,
                                          bool accurate_mul) {
+    if (impl->skip_disk_cache || stop_loading) {
+        return;
+    }
     auto& disk_cache = impl->disk_cache;
-    const auto transferable = disk_cache.LoadTransferable();
+    auto transferable = disk_cache.LoadTransferable();
     if (!transferable) {
         return;
     }
-    const auto& raws = *transferable;
+    auto& raws = *transferable;
+    if (impl->dynamic_lighting) {
+        // Older transferable caches contain every light permutation. Keep one entry
+        // per generated source before parallel compilation, including redundant state.
+        std::unordered_set<std::string> seen;
+        std::erase_if(raws, [&](const ShaderDiskCacheRaw& raw) {
+            if (stop_loading) {
+                return true;
+            }
+            if (raw.GetProgramType() != ProgramType::FS) {
+                return false;
+            }
+            const auto config = impl->MakeFragmentConfig(raw.GetRawShaderConfig());
+            return !seen.insert(GLSL::GenerateFragmentShader(config, {}, impl->profile, true))
+                        .second;
+        });
+    }
 
     // Load uncompressed precompiled file for non-separable shaders.
     // Precompiled file for separable shaders is compressed.
@@ -535,9 +666,9 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
                                                              std::move(shader));
                 } else if (raw.GetProgramType() == ProgramType::FS) {
                     // TODO: Support UserConfig in disk shader cache
-                    const FSConfig conf(raw.GetRawShaderConfig());
+                    const FSConfig conf = impl->MakeFragmentConfig(raw.GetRawShaderConfig());
                     std::scoped_lock lock(mutex);
-                    impl->fragment_shaders.Inject(conf, std::move(shader));
+                    impl->fragment_shaders.Inject(conf, std::move(shader), decomp->second.code);
                 } else {
                     // Unsupported shader type got stored somehow so nuke the cache
 
@@ -647,13 +778,14 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
                 impl->programmable_vertex_shaders.Inject(conf, code, std::move(stage));
             } else if (raw.GetProgramType() == ProgramType::FS) {
                 // TODO: Support UserConfig in disk shader cache
-                const FSConfig fs_config{raw.GetRawShaderConfig()};
-                code = GLSL::GenerateFragmentShader(fs_config, {}, impl->profile);
+                const FSConfig fs_config = impl->MakeFragmentConfig(raw.GetRawShaderConfig());
+                code = GLSL::GenerateFragmentShader(fs_config, {}, impl->profile,
+                                                    impl->dynamic_lighting);
                 OGLShaderStage stage{impl->separable};
                 stage.Create(code.c_str(), GL_FRAGMENT_SHADER);
                 handle = stage.GetHandle();
                 std::scoped_lock lock(mutex);
-                impl->fragment_shaders.Inject(fs_config, std::move(stage));
+                handle = impl->fragment_shaders.Inject(fs_config, std::move(stage), code);
             } else {
                 // Unsupported shader type got stored somehow so nuke the cache
                 LOG_ERROR(Frontend, "failed to load raw ProgramType {}", raw.GetProgramType());

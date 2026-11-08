@@ -3,7 +3,11 @@
 // Refer to the license.txt file included.
 
 #include <atomic>
+#include <cstdlib>
+#include <string>
+#include <string_view>
 
+#include "common/hacks/hack_list.h"
 #include "common/hacks/hack_manager.h"
 #include "video_core/shader/generator/glsl_fs_shader_gen.h"
 
@@ -111,8 +115,9 @@ layout (binding = 2, std140) uniform fs_data {
 )";
 
 FragmentModule::FragmentModule(const FSConfig& config_, const UserConfig& user_,
-                               const Profile& profile_)
-    : config{config_}, user{user_}, profile{profile_} {
+                               const Profile& profile_, bool dynamic_lighting_)
+    : config{config_}, user{user_}, profile{profile_},
+      dynamic_lighting{dynamic_lighting_ && !profile_.is_vulkan} {
     config.ApplyProfile(profile_);
     out.reserve(RESERVE_SIZE);
     DefineExtensions();
@@ -602,9 +607,8 @@ void FragmentModule::WriteLighting() {
         out += "vec4 shadow = vec4(1.0);\n";
     }
 
-    // Samples the specified lookup table for specular lighting
-    const auto get_lut_value = [&lighting](LightingRegs::LightingSampler sampler, u32 light_num,
-                                           LightingRegs::LightingLutInput input, bool abs) {
+    // GLSL expression for a lighting LUT input
+    const auto lut_input_index = [&lighting](LightingRegs::LightingLutInput input) {
         std::string index;
         switch (input) {
         case LightingRegs::LightingLutInput::NH:
@@ -643,23 +647,252 @@ void FragmentModule::WriteLighting() {
             index = "0.0";
             break;
         }
-
-        const auto sampler_index = static_cast<u32>(sampler);
-
-        if (abs) {
-            // LUT index is in the range of (0.0, 1.0)
-            index = lighting.lights[light_num].two_sided_diffuse
-                        ? fmt::format("abs({})", index)
-                        : fmt::format("max({}, 0.0)", index);
-            return fmt::format("LookupLightingLUTUnsigned({}, {})", sampler_index, index);
-        } else {
-            // LUT index is in the range of (-1.0, 1.0)
-            return fmt::format("LookupLightingLUTSigned({}, {})", sampler_index, index);
-        }
+        return index;
     };
 
+    // Samples the specified lookup table for specular lighting
+    const auto get_lut_value =
+        [&lighting, &lut_input_index](LightingRegs::LightingSampler sampler, u32 light_num,
+                                      LightingRegs::LightingLutInput input, bool abs) {
+            std::string index = lut_input_index(input);
+            const auto sampler_index = static_cast<u32>(sampler);
+
+            if (abs) {
+                // LUT index is in the range of (0.0, 1.0)
+                index = lighting.lights[light_num].two_sided_diffuse
+                            ? fmt::format("abs({})", index)
+                            : fmt::format("max({}, 0.0)", index);
+                return fmt::format("LookupLightingLUTUnsigned({}, {})", sampler_index, index);
+            } else {
+                // LUT index is in the range of (-1.0, 1.0)
+                return fmt::format("LookupLightingLUTSigned({}, {})", sampler_index, index);
+            }
+        };
+
+    // GL_LOOPED_LIGHTING (title-gated, OpenGL only): emit ONE loop over the enabled lights instead
+    // of one unrolled copy per light - the unrolled copies are ~70% of the NVIDIA link time of
+    // Luigi's Mansion's shaders. Each light's generation-time choices become const arrays; where
+    // a feature is off the loop multiplies by exactly 1.0, as the unrolled code does.
+    // TEST-ONLY (remove before promoting): AZ_LIGHTLOOP_OFF disables it for A/B measurements.
+    static const bool light_loop_off = std::getenv("AZ_LIGHTLOOP_OFF") != nullptr;
+    const u32 num_lights = lighting.src_num;
+    const bool loop_lights =
+        dynamic_lighting || (!light_loop_off && !profile.is_vulkan && num_lights > 1 &&
+                             Common::Hacks::g_gl_looped_lighting.load(std::memory_order_relaxed));
+    if (loop_lights) {
+        const auto per_light = [&](std::string_view type, std::string_view name,
+                                   const auto& value_of) {
+            std::string values;
+            for (u32 i = 0; i < num_lights; ++i) {
+                values += fmt::format("{}{}", i ? ", " : "", value_of(lighting.lights[i]));
+            }
+            out += fmt::format("const {0} {1}[{2}] = {0}[{2}]({3});\n", type, name, num_lights,
+                               values);
+        };
+        const auto glsl_bool = [](bool value) { return std::string(value ? "true" : "false"); };
+        const bool spot_supported = LightingRegs::IsLightingSamplerSupported(
+            lighting.config, LightingRegs::LightingSampler::SpotlightAttenuation);
+
+        if (!dynamic_lighting) {
+            per_light("int", "lm_num_values",
+                      [](const auto& light) { return std::to_string(light.num.Value()); });
+            per_light("bool", "lm_directional_values",
+                      [&](const auto& light) { return glsl_bool(light.directional); });
+            per_light("bool", "lm_two_sided_values",
+                      [&](const auto& light) { return glsl_bool(light.two_sided_diffuse); });
+            // get_lut_value picks |x| or max(x, 0) from lights[num] (not lights[i]); keep that
+            // exactly.
+            per_light("bool", "lm_lut_two_sided_values", [&](const auto& light) {
+                return glsl_bool(lighting.lights[light.num.Value()].two_sided_diffuse);
+            });
+            per_light("int", "lm_spot_lut_values", [&](const auto& light) {
+                return light.spot_atten_enable && spot_supported
+                           ? std::to_string(static_cast<u32>(
+                                 LightingRegs::SpotlightAttenuationSampler(light.num.Value())))
+                           : std::string("-1");
+            });
+            per_light("int", "lm_dist_lut_values", [&](const auto& light) {
+                return light.dist_atten_enable
+                           ? std::to_string(static_cast<u32>(
+                                 LightingRegs::DistanceAttenuationSampler(light.num.Value())))
+                           : std::string("-1");
+            });
+            per_light("bool", "lm_geo0_values",
+                      [&](const auto& light) { return glsl_bool(light.geometric_factor_0); });
+            per_light("bool", "lm_geo1_values",
+                      [&](const auto& light) { return glsl_bool(light.geometric_factor_1); });
+            per_light("bool", "lm_shadow_p_values", [&](const auto& light) {
+                return glsl_bool(lighting.shadow_primary && light.shadow_enable);
+            });
+            per_light("bool", "lm_shadow_s_values", [&](const auto& light) {
+                return glsl_bool(lighting.shadow_secondary && light.shadow_enable);
+            });
+        }
+
+        // Same as get_lut_value, with the |x| / max(x, 0) choice made per light at run time.
+        const auto loop_lut_value = [&](const std::string& sampler,
+                                        LightingRegs::LightingLutInput input, bool abs) {
+            const std::string index = lut_input_index(input);
+            if (abs) {
+                return fmt::format("LookupLightingLUTUnsigned({}, (lm_lut_two_sided ? "
+                                   "abs({}) : max({}, 0.0)))",
+                                   sampler, index, index);
+            }
+            return fmt::format("LookupLightingLUTSigned({}, {})", sampler, index);
+        };
+        const auto fixed_sampler = [](LightingRegs::LightingSampler sampler) {
+            return std::to_string(static_cast<u32>(sampler));
+        };
+        const auto lut_enabled = [&](bool enable, LightingRegs::LightingSampler sampler) {
+            return enable && LightingRegs::IsLightingSamplerSupported(lighting.config, sampler);
+        };
+
+        out += "#pragma optionNV(unroll none)\n";
+        const std::string light_count =
+            dynamic_lighting ? "int(lm_lighting[0].x)" : std::to_string(num_lights);
+        out += fmt::format("for (int lm_i = 0; lm_i < {}; ++lm_i) {{\n", light_count);
+        if (dynamic_lighting) {
+            // x is the original Light::raw (bits 0-9); y preserves the LUT sidedness
+            // lookup of the specialized generator, including remapped light slots.
+            out += "uvec4 lm_light = lm_lighting[lm_i + 1];\n"
+                   "int lm_num = int(lm_light.x & 7u);\n"
+                   "bool lm_directional = (lm_light.x & 8u) != 0u;\n"
+                   "bool lm_two_sided = (lm_light.x & 16u) != 0u;\n"
+                   "bool lm_lut_two_sided = lm_light.y != 0u;\n"
+                   "bool lm_geo0 = (lm_light.x & 128u) != 0u;\n"
+                   "bool lm_geo1 = (lm_light.x & 256u) != 0u;\n";
+            out +=
+                fmt::format("int lm_dist_lut = (lm_light.x & 32u) != 0u ? {} + lm_num : -1;\n",
+                            static_cast<u32>(LightingRegs::LightingSampler::DistanceAttenuation));
+            out +=
+                fmt::format("int lm_spot_lut = (lm_light.x & 64u) != 0u ? {} + lm_num : -1;\n",
+                            static_cast<u32>(LightingRegs::LightingSampler::SpotlightAttenuation));
+            out += fmt::format("bool lm_shadow_p = {} && (lm_light.x & 512u) != 0u;\n",
+                               glsl_bool(lighting.shadow_primary));
+            out += fmt::format("bool lm_shadow_s = {} && (lm_light.x & 512u) != 0u;\n",
+                               glsl_bool(lighting.shadow_secondary));
+        } else {
+            for (const auto name : {"lm_num", "lm_spot_lut", "lm_dist_lut"}) {
+                out += fmt::format("int {0} = {0}_values[lm_i];\n", name);
+            }
+            for (const auto name : {"lm_directional", "lm_two_sided", "lm_lut_two_sided", "lm_geo0",
+                                    "lm_geo1", "lm_shadow_p", "lm_shadow_s"}) {
+                out += fmt::format("bool {0} = {0}_values[lm_i];\n", name);
+            }
+        }
+        out += "int lm_n = lm_num;\n"
+               "light_vector = lm_directional ? light_src[lm_n].position : "
+               "light_src[lm_n].position + view;\n"
+               "light_distance = length(light_vector);\n"
+               "light_vector = normalize(light_vector);\n"
+               "spot_dir = light_src[lm_n].spot_direction;\n"
+               "half_vector = normalize(view) + light_vector;\n"
+               "dot_product = lm_two_sided ? abs(dot(light_vector, normal)) : "
+               "max(dot(light_vector, normal), 0.0);\n";
+        if (lighting.clamp_highlights) {
+            out += "clamp_highlights = sign(dot_product);\n";
+        }
+        if (spot_supported) {
+            out += fmt::format(
+                "float lm_spot = lm_spot_lut >= 0 ? ({:#} * {}) : 1.0;\n",
+                lighting.lut_sp.GetScale(),
+                loop_lut_value("lm_spot_lut", lighting.lut_sp.type, lighting.lut_sp.abs_input));
+        } else {
+            out += "float lm_spot = 1.0;\n";
+        }
+        out += "float lm_dist = lm_dist_lut >= 0 ? "
+               "LookupLightingLUTUnsigned(lm_dist_lut, clamp(light_src[lm_n]."
+               "dist_atten_scale * light_distance + light_src[lm_n].dist_atten_bias, 0.0, 1.0)) "
+               ": 1.0;\n"
+               "if (lm_geo0 || lm_geo1) {\n"
+               "geo_factor = dot(half_vector, half_vector);\n"
+               "geo_factor = geo_factor == 0.0 ? 0.0 : min(dot_product / geo_factor, 1.0);\n"
+               "}\n";
+
+        std::string d0_value = "1.0";
+        if (lut_enabled(lighting.lut_d0.enable, LightingRegs::LightingSampler::Distribution0)) {
+            d0_value = fmt::format(
+                "({:#} * {})", lighting.lut_d0.GetScale(),
+                loop_lut_value(fixed_sampler(LightingRegs::LightingSampler::Distribution0),
+                               lighting.lut_d0.type, lighting.lut_d0.abs_input));
+        }
+        out += fmt::format("vec3 lm_spec0 = ({} * light_src[lm_n].specular_0) * "
+                           "(lm_geo0 ? geo_factor : 1.0);\n",
+                           d0_value);
+
+        if (lut_enabled(lighting.lut_rr.enable, LightingRegs::LightingSampler::ReflectRed)) {
+            out +=
+                fmt::format("refl_value.r = ({:#} * {});\n", lighting.lut_rr.GetScale(),
+                            loop_lut_value(fixed_sampler(LightingRegs::LightingSampler::ReflectRed),
+                                           lighting.lut_rr.type, lighting.lut_rr.abs_input));
+        } else {
+            out += "refl_value.r = 1.0;\n";
+        }
+        if (lut_enabled(lighting.lut_rg.enable, LightingRegs::LightingSampler::ReflectGreen)) {
+            out += fmt::format(
+                "refl_value.g = ({:#} * {});\n", lighting.lut_rg.GetScale(),
+                loop_lut_value(fixed_sampler(LightingRegs::LightingSampler::ReflectGreen),
+                               lighting.lut_rg.type, lighting.lut_rg.abs_input));
+        } else {
+            out += "refl_value.g = refl_value.r;\n";
+        }
+        if (lut_enabled(lighting.lut_rb.enable, LightingRegs::LightingSampler::ReflectBlue)) {
+            out += fmt::format(
+                "refl_value.b = ({:#} * {});\n", lighting.lut_rb.GetScale(),
+                loop_lut_value(fixed_sampler(LightingRegs::LightingSampler::ReflectBlue),
+                               lighting.lut_rb.type, lighting.lut_rb.abs_input));
+        } else {
+            out += "refl_value.b = refl_value.r;\n";
+        }
+
+        std::string d1_value = "1.0";
+        if (lut_enabled(lighting.lut_d1.enable, LightingRegs::LightingSampler::Distribution1)) {
+            d1_value = fmt::format(
+                "({:#} * {})", lighting.lut_d1.GetScale(),
+                loop_lut_value(fixed_sampler(LightingRegs::LightingSampler::Distribution1),
+                               lighting.lut_d1.type, lighting.lut_d1.abs_input));
+        }
+        out += fmt::format("vec3 lm_spec1 = ({} * refl_value * light_src[lm_n].specular_1) * "
+                           "(lm_geo1 ? geo_factor : 1.0);\n",
+                           d1_value);
+
+        out += "diffuse_sum.rgb += ((light_src[lm_n].diffuse * dot_product * "
+               "(lm_shadow_p ? shadow.rgb : vec3(1.0))) + light_src[lm_n].ambient) * "
+               "lm_dist * lm_spot;\n"
+               "specular_sum.rgb += (lm_spec0 + lm_spec1) * clamp_highlights * lm_dist * lm_spot "
+               "* (lm_shadow_s ? shadow.rgb : vec3(1.0));\n"
+               "}\n";
+
+        // Fresnel applies to the last light only, from that light's vectors - which the loop
+        // leaves in light_vector / half_vector / spot_dir. It only writes the alpha channels,
+        // which the per-light sums above never touch, so running it after the loop is identical.
+        const auto& last_light = lighting.lights[num_lights - 1];
+        if (lut_enabled(lighting.lut_fr.enable, LightingRegs::LightingSampler::Fresnel)) {
+            std::string value;
+            if (dynamic_lighting) {
+                const std::string index = lut_input_index(lighting.lut_fr.type);
+                const std::string sampler = fixed_sampler(LightingRegs::LightingSampler::Fresnel);
+                value = lighting.lut_fr.abs_input
+                            ? fmt::format("LookupLightingLUTUnsigned({}, (lm_lighting[{}].y != 0u "
+                                          "? abs({}) : max({}, 0.0)))",
+                                          sampler, light_count, index, index)
+                            : fmt::format("LookupLightingLUTSigned({}, {})", sampler, index);
+            } else {
+                value = get_lut_value(LightingRegs::LightingSampler::Fresnel, last_light.num,
+                                      lighting.lut_fr.type, lighting.lut_fr.abs_input);
+            }
+            value = fmt::format("({:#} * {})", lighting.lut_fr.GetScale(), value);
+            if (lighting.enable_primary_alpha) {
+                out += fmt::format("diffuse_sum.a = {};\n", value);
+            }
+            if (lighting.enable_secondary_alpha) {
+                out += fmt::format("specular_sum.a = {};\n", value);
+            }
+        }
+    }
+
     // Write the code to emulate each enabled light
-    for (u32 light_index = 0; light_index < lighting.src_num; ++light_index) {
+    for (u32 light_index = 0; !loop_lights && light_index < lighting.src_num; ++light_index) {
         const auto& light_config = lighting.lights[light_index];
         const std::string light_src = fmt::format("light_src[{}]", light_config.num.Value());
 
@@ -837,7 +1070,6 @@ void FragmentModule::WriteLighting() {
     out += "diffuse_sum.rgb += lighting_global_ambient;\n"
            "primary_fragment_color = clamp(diffuse_sum, vec4(0.0), vec4(1.0));\n"
            "secondary_fragment_color = clamp(specular_sum, vec4(0.0), vec4(1.0));\n";
-
 
     // (The blanket "secondary_fragment_color.b = 1.0" override that used to sit
     // here was REMOVED 2026-07-25. It fixed the frog but tinted the whole game
@@ -1362,6 +1594,9 @@ void FragmentModule::DefineBindingsVK() {
 }
 
 void FragmentModule::DefineBindingsGL() {
+    if (dynamic_lighting && config.lighting.enable) {
+        out += "layout(location = 0) uniform uvec4 lm_lighting[9];\n";
+    }
     // Uniform and texture buffers
     out += FSUniformBlockDef;
     out += "layout(binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n";
@@ -1811,8 +2046,8 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
 }
 
 std::string GenerateFragmentShader(const FSConfig& config, const UserConfig& user,
-                                   const Profile& profile) {
-    FragmentModule module{config, user, profile};
+                                   const Profile& profile, bool dynamic_lighting) {
+    FragmentModule module{config, user, profile, dynamic_lighting};
     return module.Generate();
 }
 

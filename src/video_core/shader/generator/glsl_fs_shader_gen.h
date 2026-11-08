@@ -10,7 +10,8 @@ namespace Pica::Shader::Generator::GLSL {
 
 class FragmentModule {
 public:
-    explicit FragmentModule(const FSConfig& config, const UserConfig& user, const Profile& profile);
+    explicit FragmentModule(const FSConfig& config, const UserConfig& user, const Profile& profile,
+                            bool dynamic_lighting = false);
     ~FragmentModule();
 
     /// Emits GLSL source corresponding to the provided pica fragment configuration
@@ -87,6 +88,7 @@ private:
     const UserConfig& user;
     const Profile& profile;
     std::string out;
+    bool dynamic_lighting{};
     bool use_blend_fallback{};
     bool use_fragment_shader_interlock{};
     bool use_fragment_shader_barycentric{};
@@ -99,6 +101,6 @@ private:
  * @returns String of the shader source code
  */
 std::string GenerateFragmentShader(const FSConfig& config, const UserConfig& user,
-                                   const Profile& profile);
+                                   const Profile& profile, bool dynamic_lighting = false);
 
 } // namespace Pica::Shader::Generator::GLSL

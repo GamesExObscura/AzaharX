@@ -40,6 +40,7 @@ std::atomic<bool> g_force_cpu_bottom_screen{false};
 std::atomic<bool> g_fb_flip_rect_disable{false};
 std::atomic<bool> g_ignore_format_reinterpretation{false};
 std::atomic<bool> g_force_validated_pica_index{false};
+std::atomic<bool> g_gl_looped_lighting{false};
 
 HackManager hack_manager = {
     .entries = {
@@ -436,6 +437,17 @@ HackManager hack_manager = {
              .affected_title_ids = {},
          }},
 
+        // OpenGL first-visit shader freezes — see HackType::GL_LOOPED_LIGHTING.
+        {HackType::GL_LOOPED_LIGHTING,
+         HackEntry{
+             .mode = HackAllowMode::FORCE,
+             .affected_title_ids =
+                 {
+                     // Luigi's Mansion: Dark Moon USA
+                     0x0004000000055F00,
+                 },
+         }},
+
         // Per-screen framebuffer config probe — see
         // HackType::FB_CONFIG_DIAG. Log-only.
         {HackType::FB_CONFIG_DIAG,
@@ -612,6 +624,9 @@ HackManager hack_manager = {
                      // Ace Combat: Assault Horizon Legacy: distance haze replaced by a
                      // hard cyan band; distant islands drawn sharp.
                      0x0004000000064900, // USA
+                     // Sonic Lost World and Shattered Crystal: preserve hardware color clamping.
+                     0x00040000000C8C00, // USA, Sonic Lost World
+                     0x0004000000127500, // USA, Sonic Boom: Shattered Crystal
                  },
          }},
 

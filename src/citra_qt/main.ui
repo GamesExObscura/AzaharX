@@ -236,6 +236,7 @@
     <addaction name="separator"/>
     <addaction name="action_Open_Log_Folder"/>
     <addaction name="action_FAQ"/>
+    <addaction name="action_Check_For_Updates"/>
     <addaction name="action_About"/>
    </widget>
    <addaction name="menu_File"/>
@@ -340,6 +341,11 @@
   <action name="action_FAQ">
    <property name="text">
     <string>FAQ</string>
+   </property>
+  </action>
+  <action name="action_Check_For_Updates">
+   <property name="text">
+    <string>Check for Updates...</string>
    </property>
   </action>
   <action name="action_About">

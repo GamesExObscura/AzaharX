@@ -16,6 +16,16 @@
 #include "citra_qt/uisettings.h"
 #include "citra_qt/util/clickable_label.h"
 #include "common/logging/log.h"
+#include "Transport.h"
+
+namespace {
+bool LinkOwnsRadio(QWidget* parent) {
+    if (!WiiU3DSLink::GetTransport().GetStatus().enabled) return false;
+    QMessageBox::warning(parent, QObject::tr("Wii U/3DS Link"),
+        QObject::tr("Stop the game and disable the Wii U/3DS link before joining a multiplayer room. Your room and Pretendo settings are unchanged."));
+    return true;
+}
+}
 
 MultiplayerState::MultiplayerState(Core::System& system_, QWidget* parent,
                                    QStandardItemModel* game_list_model, QAction* leave_room,
@@ -203,6 +213,7 @@ static void BringWidgetToFront(QWidget* widget) {
 }
 
 void MultiplayerState::OnViewLobby() {
+    if (LinkOwnsRadio(this)) return;
     if (lobby == nullptr) {
         lobby = new Lobby(system, this, game_list_model, announce_multiplayer_session);
     }
@@ -210,6 +221,7 @@ void MultiplayerState::OnViewLobby() {
 }
 
 void MultiplayerState::OnCreateRoom() {
+    if (LinkOwnsRadio(this)) return;
     if (host_room == nullptr) {
         host_room = new HostRoomWindow(system, this, game_list_model, announce_multiplayer_session);
     }
@@ -274,6 +286,7 @@ void MultiplayerState::OnOpenNetworkRoom() {
 }
 
 void MultiplayerState::OnDirectConnectToRoom() {
+    if (LinkOwnsRadio(this)) return;
     if (direct_connect == nullptr) {
         direct_connect = new DirectConnectWindow(system, this);
     }

@@ -4,7 +4,10 @@
 
 #pragma once
 
+#include <array>
 #include <optional>
+#include <tuple>
+#include "common/common_types.h"
 
 #include <QDialog>
 #include <QLineEdit>

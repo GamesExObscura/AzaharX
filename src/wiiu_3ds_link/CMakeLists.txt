@@ -1,0 +1,8 @@
+add_library(WiiU3DSLink STATIC Transport.cpp Transport.h NativeFrames.h UdsHost.cpp UdsHost.h LanDatagram.cpp LanDatagram.h)
+target_compile_features(WiiU3DSLink PUBLIC cxx_std_20)
+target_include_directories(WiiU3DSLink PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(WiiU3DSLink PRIVATE Boost::boost Threads::Threads)
+if(WIN32)
+    target_compile_definitions(WiiU3DSLink PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(WiiU3DSLink PRIVATE ws2_32 mswsock bcrypt)
+endif()

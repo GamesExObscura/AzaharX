@@ -7,6 +7,7 @@
 #include <array>
 #include <deque>
 #include <vector>
+#include <span>
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "core/hle/service/service.h"
@@ -127,6 +128,10 @@ static_assert(sizeof(BeaconData) == 0x12, "BeaconData has incorrect size.");
  * Decrypts the beacon data buffer for the network described by `network_info`.
  */
 void DecryptBeacon(const NetworkInfo& network_info, std::vector<u8>& buffer);
+
+// Bounded emulator-link decoder; the ordinary multiplayer-room path is unchanged.
+bool DecryptPrivateLinkBeacon(const NetworkInfo& network_info, std::span<const u8> first,
+                              std::span<const u8> second, NodeList& nodes);
 
 /**
  * Generates an 802.11 beacon frame starting at the management frame header.

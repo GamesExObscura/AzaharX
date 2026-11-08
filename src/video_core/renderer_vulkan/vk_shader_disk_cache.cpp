@@ -269,10 +269,17 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
     return it.value().get();
 }
 
-ShaderDiskCache::SourceFileCacheVersionHash ShaderDiskCache::GetSourceFileCacheVersionHash() {
+ShaderDiskCache::SourceFileCacheVersionHash ShaderDiskCache::GetSourceFileCacheVersionHash(u64 program_id) {
     SourceFileCacheVersionHash hash{};
     const std::size_t length = std::min(std::strlen(Common::g_shader_cache_version), hash.size());
     std::memcpy(hash.data(), Common::g_shader_cache_version, length);
+    if (program_id == 0x00040000000C8C00ULL || program_id == 0x0004000000127500ULL) {
+        // The title policy changed, not the GLSL generator file: reject old overbright SPIR-V.
+        hash[0] ^= 0x53;
+        hash[1] ^= 0x4c;
+        hash[2] ^= 0x57;
+        hash[3] ^= 0x01;
+    }
     return hash;
 }
 
@@ -557,7 +564,7 @@ bool ShaderDiskCache::RecreateCache(CacheFile& file, CacheFileType type) {
         .file_version = FileInfoEntry::CACHE_FILE_VERSION,
         .config_struct_hash = get_hash(type),
         .file_type = type,
-        .source_hash = GetSourceFileCacheVersionHash(),
+        .source_hash = GetSourceFileCacheVersionHash(title_id),
         .build_name = build_name,
         .profile = parent.profile,
     };
@@ -612,7 +619,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
         return false;
     }
 
-    if (file_info->source_hash != GetSourceFileCacheVersionHash()) {
+    if (file_info->source_hash != GetSourceFileCacheVersionHash(title_id)) {
         LOG_INFO(Render_Vulkan, "Cache contains old vertex program, cache needs regeneration.");
         regenerate_file = std::make_unique<CacheFile>(GetVSFile(title_id, true));
     }
@@ -922,7 +929,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
         return false;
     }
 
-    if (file_info->source_hash != GetSourceFileCacheVersionHash()) {
+    if (file_info->source_hash != GetSourceFileCacheVersionHash(title_id)) {
         LOG_INFO(Render_Vulkan, "Cache contains old fragment program, cache needs regeneration.");
         regenerate_file = std::make_unique<CacheFile>(GetFSFile(title_id, true));
     }
@@ -1145,7 +1152,7 @@ bool ShaderDiskCache::InitGSCache(const std::atomic_bool& stop_loading,
     const auto geo_shaders_needed = parent.instance.UseGeometryShaders() &&
                                     !parent.instance.IsFragmentShaderBarycentricSupported();
 
-    if (geo_shaders_needed && file_info->source_hash != GetSourceFileCacheVersionHash()) {
+    if (geo_shaders_needed && file_info->source_hash != GetSourceFileCacheVersionHash(title_id)) {
         LOG_INFO(Render_Vulkan, "Cache contains old fragment program, cache needs regeneration.");
         regenerate_file = std::make_unique<CacheFile>(GetGSFile(title_id, true));
     }

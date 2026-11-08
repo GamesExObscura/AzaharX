@@ -1112,6 +1112,17 @@ void GPU::ApplyPerProgramSettings(u64 program_ID) {
                  program_ID);
     }
 
+    // OpenGL first-visit shader freezes — see HackType::GL_LOOPED_LIGHTING.
+    auto light_loop_hack = Common::Hacks::hack_manager.GetHack(
+        Common::Hacks::HackType::GL_LOOPED_LIGHTING, program_ID);
+    const bool gl_looped_lighting =
+        light_loop_hack && light_loop_hack->mode == Common::Hacks::HackAllowMode::FORCE;
+    Common::Hacks::g_gl_looped_lighting.store(gl_looped_lighting, std::memory_order_relaxed);
+    if (gl_looped_lighting) {
+        LOG_INFO(HW_GPU, "[GL-LIGHTLOOP] looped lighting armed for program 0x{:016x}",
+                 program_ID);
+    }
+
     // Kernel blocking-wait diagnostic — see HackType::KERNEL_WAIT_DIAG.
     auto kernel_wait_hack = Common::Hacks::hack_manager.GetHack(
         Common::Hacks::HackType::KERNEL_WAIT_DIAG, program_ID);

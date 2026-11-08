@@ -5,6 +5,7 @@
 #define CRYPTOPP_ENABLE_NAMESPACE_WEAK 1
 
 #include <cstring>
+#include <algorithm>
 #include <cryptopp/aes.h>
 #include <cryptopp/md5.h>
 #include <cryptopp/modes.h>
@@ -228,6 +229,47 @@ void DecryptBeacon(const NetworkInfo& network_info, std::vector<u8>& buffer) {
     CryptoPP::CTR_Mode<AES>::Decryption aes;
     aes.SetKeyWithIV(nwm_beacon_key.data(), AES::BLOCKSIZE, counter.data());
     aes.ProcessData(buffer.data(), buffer.data(), buffer.size());
+}
+
+bool DecryptPrivateLinkBeacon(const NetworkInfo& network_info, std::span<const u8> first,
+                              std::span<const u8> second, NodeList& nodes) {
+    nodes.clear();
+    if (network_info.max_nodes < 2 || network_info.max_nodes > 9 ||
+        network_info.oui_value != NintendoOUI || network_info.oui_type != 21 ||
+        network_info.application_data_size > ApplicationDataSize) return false;
+    const std::size_t required = sizeof(BeaconData) + network_info.max_nodes * sizeof(BeaconNodeInfo);
+    const std::size_t first_size = std::min<std::size_t>(required, 250);
+    const std::size_t second_size = required - first_size;
+    const auto valid_tag = [](std::span<const u8> bytes, u8 type, std::size_t size) {
+        return bytes.size() >= 4 + size && bytes[0] == 0 && bytes[1] == 0x1F &&
+               bytes[2] == 0x32 && bytes[3] == type;
+    };
+    if (!valid_tag(first, 24, first_size) ||
+        (second_size && !valid_tag(second, 25, second_size))) return false;
+    std::vector<u8> plain(first.begin() + 4, first.begin() + 4 + first_size);
+    if (second_size) plain.insert(plain.end(), second.begin() + 4, second.begin() + 4 + second_size);
+    DecryptBeacon(network_info, plain);
+    std::array<u8, 16> hash{};
+    CryptoPP::Weak::MD5().CalculateDigest(hash.data(), plain.data() + 16, plain.size() - 16);
+    if (!std::equal(hash.begin(), hash.end(), plain.begin())) return false;
+    u16 mask = 0;
+    NodeList decoded(network_info.max_nodes);
+    for (std::size_t index = 0; index < decoded.size(); ++index) {
+        BeaconNodeInfo wire{};
+        std::memcpy(&wire, plain.data() + sizeof(BeaconData) + index * sizeof(wire), sizeof(wire));
+        const u16 id = wire.network_node_id;
+        if (id && (id > network_info.max_nodes || (mask & (1U << (id - 1))))) return false;
+        if (id) mask |= static_cast<u16>(1U << (id - 1));
+        auto& node = decoded[index];
+        node.friend_code_seed = wire.friend_code_seed;
+        node.network_node_id = id;
+        for (std::size_t character = 0; character < node.username.size(); ++character)
+            node.username[character] = wire.username[character];
+    }
+    const u16 advertised_mask = static_cast<u16>((plain[16] << 8) | plain[17]);
+    if (!(mask & 1) || mask != advertised_mask) return false;
+    nodes = std::move(decoded);
+    return true;
 }
 
 /**

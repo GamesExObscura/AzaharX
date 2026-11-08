@@ -14,6 +14,7 @@
 #include "network/packet.h"
 #include "network/room.h"
 #include "network/verify_user.h"
+#include "Transport.h"
 
 namespace Network {
 
@@ -1018,6 +1019,7 @@ bool Room::Create(const std::string& name, const std::string& description,
                   const std::string& preferred_game, u64 preferred_game_id,
                   std::unique_ptr<VerifyUser::Backend> verify_backend,
                   const Room::BanList& ban_list) {
+    if (WiiU3DSLink::GetTransport().GetStatus().enabled) return false;
     ENetAddress address;
     address.host = ENET_HOST_ANY;
     if (!server_address.empty()) {

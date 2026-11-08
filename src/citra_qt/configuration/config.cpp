@@ -847,6 +847,7 @@ void QtConfig::ReadUIValues() {
         ReadMultiplayerValues();
 
         ReadBasicSetting(UISettings::values.single_window_mode);
+        ReadBasicSetting(UISettings::values.wiiu_3ds_link_enabled);
         ReadBasicSetting(UISettings::values.fullscreen);
         ReadBasicSetting(UISettings::values.display_titlebar);
         ReadBasicSetting(UISettings::values.show_filter_bar);
@@ -1382,6 +1383,7 @@ void QtConfig::SaveUIValues() {
         SaveMultiplayerValues();
 
         WriteBasicSetting(UISettings::values.single_window_mode);
+        WriteBasicSetting(UISettings::values.wiiu_3ds_link_enabled);
         WriteBasicSetting(UISettings::values.fullscreen);
         WriteBasicSetting(UISettings::values.display_titlebar);
         WriteBasicSetting(UISettings::values.show_filter_bar);

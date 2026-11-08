@@ -314,6 +314,9 @@ private slots:
     void OnMute();
 #ifdef ENABLE_QT_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
+    void OnCheckForUpdates();
+    void OnManualUpdateCheckFinished();
+    void ShowUpdatePrompt(const QString& latest_tag);
 #endif
     void ShowInfinityBase();
     void OnSwitchDiskResources(VideoCore::LoadCallbackStage stage, std::size_t value,
@@ -460,6 +463,9 @@ private:
     // Prompt shown when update check succeeds
     QFuture<QString> update_future;
     QFutureWatcher<QString> update_watcher;
+    // Help > Check for Updates: the latest release tag, or empty if GitHub couldn't be reached
+    QFuture<QString> manual_update_future;
+    QFutureWatcher<QString> manual_update_watcher;
 #endif
 
 #ifdef __unix__

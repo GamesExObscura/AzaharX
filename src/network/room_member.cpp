@@ -12,6 +12,7 @@
 #include "enet/enet.h"
 #include "network/packet.h"
 #include "network/room_member.h"
+#include "Transport.h"
 
 namespace Network {
 
@@ -540,6 +541,11 @@ void RoomMember::Join(const std::string& nick, const std::string& console_id_has
                       const char* server_addr, u16 server_port, u16 client_port,
                       const MacAddress& preferred_mac, const std::string& password,
                       const std::string& token) {
+    // Refuse the other local-radio backend before touching an existing room.
+    if (WiiU3DSLink::GetTransport().GetStatus().enabled) {
+        room_member_impl->SetError(Error::CouldNotConnect);
+        return;
+    }
     // If the member is connected, kill the connection first
     if (room_member_impl->loop_thread && room_member_impl->loop_thread->joinable()) {
         Leave();
